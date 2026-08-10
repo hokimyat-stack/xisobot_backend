@@ -79,6 +79,22 @@ async function auditLog(kim, amal, tafsilot = '') {
   }]);
 }
 
+// Cloudflare R2 ga base64 rasmni yuklash yordamchi funksiyasi
+async function r2RasmYukla(base64Data, folder = 'reports') {
+  if (!base64Data) return null;
+  const buffer = Buffer.from(base64Data, 'base64');
+  const fileName = `${folder}/${Date.now()}_${Math.random().toString(36).substring(7)}.jpg`;
+  
+  await s3.send(new PutObjectCommand({
+    Bucket: process.env.R2_BUCKET_NAME,
+    Key: fileName,
+    Body: buffer,
+    ContentType: 'image/jpeg',
+  }));
+
+  return `${process.env.R2_PUBLIC_URL}/${fileName}`;
+}
+
 // ==========================================
 // 3. TIZIMGA KIRISH (LOGIN)
 // ==========================================
@@ -162,31 +178,32 @@ app.get('/api/xodimlar', async (req, res) => {
 });
 
 app.get('/api/hisobotlar', async (req, res) => {
-  const user = await checkAuth(req);
-  if (!user) return res.json({ ok: false });
-  
-  let query = supabase.from('hisobotlar').select('*').order('b_vaqt', { ascending: false });
-  if (req.query.xodim) query = query.eq('xodim_id', req.query.xodim);
-  if (req.query.dan) query = query.gte('sana', req.query.dan);
-  if (req.query.gacha) query = query.lte('sana', req.query.gacha);
+  try {
+    let query = supabase.from('hisobotlar').select('*').order('b_vaqt', { ascending: false });
+    if (req.query.xodim) query = query.eq('xodim_id', req.query.xodim);
+    if (req.query.dan) query = query.gte('sana', req.query.dan);
+    if (req.query.gacha) query = query.lte('sana', req.query.gacha);
 
-  const { data } = await query;
-  const hisobotlar = (data || []).map(h => ({
-    id: h.id, xodimId: h.xodim_id, xodimFio: h.xodim_fio,
-    mfyId: h.mfy_id, mfyNomi: h.mfy_nomi,
-    kategoriyaId: h.kategoriya_id, kategoriyaNomi: h.kategoriya_nomi,
-    ishTuri: h.ish_turi, ishNomi: h.ish_nomi,
-    b_vaqt: h.b_vaqt, b_tavsif: h.b_tavsif, b_lat: h.b_lat, b_lng: h.b_lng, 
-    b_rasmlar: h.b_rasmlar ? h.b_rasmlar.split(',') : [],
-    d_vaqt: h.d_vaqt, d_tavsif: h.d_tavsif, d_lat: h.d_lat, d_lng: h.d_lng, 
-    d_rasmlar: h.d_rasmlar ? h.d_rasmlar.split(',') : [],
-    y_vaqt: h.y_vaqt, y_tavsif: h.y_tavsif, y_lat: h.y_lat, y_lng: h.y_lng, 
-    y_rasmlar: h.y_rasmlar ? h.y_rasmlar.split(',') : [],
-    reyting: h.reyting, kechikkan: h.kechikkan, sana: h.sana, haftaKuni: h.hafta_kuni,
-    flagSabab: h.flag_sabab
-  }));
+    const { data } = await query;
+    const hisobotlar = (data || []).map(h => ({
+      id: h.id, xodimId: h.xodim_id, xodimFio: h.xodim_fio,
+      mfyId: h.mfy_id, mfyNomi: h.mfy_nomi,
+      kategoriyaId: h.kategoriya_id, kategoriyaNomi: h.kategoriya_nomi,
+      ishTuri: h.ish_turi, ishNomi: h.ish_nomi,
+      b_vaqt: h.b_vaqt, b_tavsif: h.b_tavsif, b_lat: h.b_lat, b_lng: h.b_lng, 
+      b_rasmlar: h.b_rasmlar ? h.b_rasmlar.split(',') : [],
+      d_vaqt: h.d_vaqt, d_tavsif: h.d_tavsif, d_lat: h.d_lat, d_lng: h.d_lng, 
+      d_rasmlar: h.d_rasmlar ? h.d_rasmlar.split(',') : [],
+      y_vaqt: h.y_vaqt, y_tavsif: h.y_tavsif, y_lat: h.y_lat, y_lng: h.y_lng, 
+      y_rasmlar: h.y_rasmlar ? h.y_rasmlar.split(',') : [],
+      reyting: h.reyting, kechikkan: h.kechikkan, sana: h.sana, haftaKuni: h.hafta_kuni,
+      flagSabab: h.flag_sabab, bosqich: h.bosqich || 'BOSHLANDI'
+    }));
 
-  res.json({ ok: true, hisobotlar });
+    res.json({ ok: true, hisobotlar });
+  } catch (err) {
+    res.json({ ok: false, xato: err.message });
+  }
 });
 
 app.get('/api/adminlar', async (req, res) => {
@@ -330,7 +347,6 @@ app.post('/api/adminOchir', async (req, res) => {
 // --- BOSHQALAR (Eslatmalar, Sozlamalar) ---
 app.post('/api/eslatmaYuborGuruh', async (req, res) => {
   const u = await checkAuth(req); if (!u) return res.json({ ok: false });
-  // Hozircha Eslatmalar simulatsiyasi qilinadi (mobil ilova API ulanmaguncha)
   await auditLog(u.fio, 'ESLATMA_GURUH', `${req.body.xodimIdlar.length} ta xodimga`);
   res.json({ ok: true, yuborildi: req.body.xodimIdlar.length });
 });
@@ -345,6 +361,146 @@ app.post('/api/sozlamaSaqla', async (req, res) => {
   await supabase.from('sozlamalar').upsert([{ kalit: 'INTERVAL_DAQIQA', qiymat: req.body.interval }]);
   await auditLog(u.fio, 'SOZLAMA_O_ZGARTIRILDI', `Interval: ${req.body.interval}`);
   res.json({ ok: true });
+});
+
+// ==========================================
+// 6. XODIMLAR UCHUN LOGIN VA HISOBOT API'LARI
+// ==========================================
+
+// Xodim logini (PINFL va Parol orqali)
+app.post('/api/xodim-login', async (req, res) => {
+  try {
+    const { pinfl, parol, deviceId } = req.body;
+    const { data: xodim, error } = await supabase.from('xodimlar').select('*').eq('pinfl', pinfl).single();
+
+    if (error || !xodim) return res.json({ ok: false, xato: "PINFL yoki parol noto'g'ri" });
+    if (xodim.holat !== 'faol') return res.json({ ok: false, xato: "Hisob bloklangan" });
+    if (xodim.parol_hash !== parolHash(parol)) return res.json({ ok: false, xato: "PINFL yoki parol noto'g'ri" });
+
+    // Device Binding (Qurilmani bog'lash)
+    if (xodim.device_id && xodim.device_id !== deviceId) {
+      return res.json({ ok: false, xato: "Bu hisob boshqa qurilmaga bog'langan!" });
+    }
+    if (!xodim.device_id && deviceId) {
+      await supabase.from('xodimlar').update({ device_id: deviceId }).eq('id', xodim.id);
+    }
+
+    res.json({ ok: true, xodim: { id: xodim.id, fio: xodim.fio, mfyId: xodim.mfy_id, kategoriyaId: xodim.kategoriya_id } });
+  } catch (err) {
+    res.json({ ok: false, xato: err.message });
+  }
+});
+
+// 1-Bosqich: Ish boshlash
+app.post('/api/hisobotBoshla', async (req, res) => {
+  try {
+    const { xodimId, ishTuri, ishNomi, tavsif, lat, lng, rasmlar, deviceVaqt } = req.body;
+    
+    const { data: x } = await supabase.from('xodimlar').select('fio, mfy_id, kategoriya_id').eq('id', xodimId).single();
+    const { data: m } = await supabase.from('mfy').select('nomi').eq('id', x.mfy_id).single();
+    const { data: k } = await supabase.from('kategoriyalar').select('nomi').eq('id', x.kategoriya_id).single();
+
+    let yuklanganRasmlar = [];
+    for (let rB64 of rasmlar) {
+      const url = await r2RasmYukla(rB64);
+      if (url) yuklanganRasmlar.push(url);
+    }
+
+    const id = genId('H');
+    const sana = new Date().toISOString().slice(0, 10);
+    
+    await supabase.from('hisobotlar').insert([{
+      id, xodim_id: xodimId, xodim_fio: x.fio,
+      mfy_id: x.mfy_id, mfy_nomi: m?.nomi || '',
+      kategoriya_id: x.kategoriya_id, kategoriya_nomi: k?.nomi || '',
+      ish_turi: ishTuri, ish_nomi: ishNomi,
+      b_vaqt: deviceVaqt || new Date().toISOString(), b_tavsif: tavsif,
+      b_lat: lat, b_lng: lng, b_rasmlar: yuklanganRasmlar.join(','),
+      bosqich: 'BOSHLANDI', sana, reyting: 'YASHIL'
+    }]);
+
+    res.json({ ok: true, id });
+  } catch (err) {
+    res.json({ ok: false, xato: err.message });
+  }
+});
+
+// 2-Bosqich: Davom etmoqda
+app.post('/api/hisobotDavom', async (req, res) => {
+  try {
+    const { hisobotId, tavsif, lat, lng, rasmlar, deviceVaqt } = req.body;
+    let yuklanganRasmlar = [];
+    for (let rB64 of rasmlar) {
+      const url = await r2RasmYukla(rB64);
+      if (url) yuklanganRasmlar.push(url);
+    }
+
+    await supabase.from('hisobotlar').update({
+      d_vaqt: deviceVaqt || new Date().toISOString(), d_tavsif: tavsif,
+      d_lat: lat, d_lng: lng, d_rasmlar: yuklanganRasmlar.join(','),
+      bosqich: 'DAVOM_ETMOQDA'
+    }).eq('id', hisobotId);
+
+    res.json({ ok: true });
+  } catch (err) {
+    res.json({ ok: false, xato: err.message });
+  }
+});
+
+// 3-Bosqich: Yakunlandi
+app.post('/api/hisobotYakun', async (req, res) => {
+  try {
+    const { hisobotId, tavsif, lat, lng, rasmlar, deviceVaqt } = req.body;
+    let yuklanganRasmlar = [];
+    for (let rB64 of rasmlar) {
+      const url = await r2RasmYukla(rB64);
+      if (url) yuklanganRasmlar.push(url);
+    }
+
+    await supabase.from('hisobotlar').update({
+      y_vaqt: deviceVaqt || new Date().toISOString(), y_tavsif: tavsif,
+      y_lat: lat, y_lng: lng, y_rasmlar: yuklanganRasmlar.join(','),
+      bosqich: 'YAKUNLANDI'
+    }).eq('id', hisobotId);
+
+    res.json({ ok: true });
+  } catch (err) {
+    res.json({ ok: false, xato: err.message });
+  }
+});
+
+// Xodim parolini almashtirishi
+app.post('/api/xodimParolAlmashtir', async (req, res) => {
+  try {
+    const { xodimId, eskiParol, yangiParol } = req.body;
+    const { data: xodim, error } = await supabase.from('xodimlar').select('*').eq('id', xodimId).single();
+
+    if (error || !xodim) return res.json({ ok: false, xato: "Xodim topilmadi" });
+    if (xodim.parol_hash !== parolHash(eskiParol)) return res.json({ ok: false, xato: "Eski parol noto'g'ri" });
+
+    await supabase.from('xodimlar').update({ parol_hash: parolHash(yangiParol) }).eq('id', xodimId);
+    res.json({ ok: true });
+  } catch (err) {
+    res.json({ ok: false, xato: err.message });
+  }
+});
+
+// Tahrir so'rash
+app.post('/api/tahrirSora', async (req, res) => {
+  try {
+    const { hisobotId, xodimId, xodimFio, sabab } = req.body;
+    const id = genId('T');
+    const sana = new Date().toISOString().slice(0, 10);
+
+    await supabase.from('tahrir_sorovlari').insert([{
+      id, hisobot_id: hisobotId, xodim_id: xodimId, xodim_fio: xodimFio,
+      sabab, status: 'KUTILMOQDA', sana
+    }]);
+
+    res.json({ ok: true });
+  } catch (err) {
+    res.json({ ok: false, xato: err.message });
+  }
 });
 
 // SERVERNI ISHGA TUSHIRISH
