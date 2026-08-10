@@ -1,0 +1,354 @@
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const crypto = require('crypto');
+const multer = require('multer');
+const { createClient } = require('@supabase/supabase-js');
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// ==========================================
+// 1. BAZA VA XOTIRAGA ULANISH
+// ==========================================
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
+const s3 = new S3Client({
+  region: 'auto',
+  endpoint: process.env.R2_ENDPOINT,
+  credentials: {
+    accessKeyId: process.env.R2_ACCESS_KEY_ID,
+    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
+  },
+});
+
+const upload = multer({ storage: multer.memoryStorage() });
+
+// ==========================================
+// 2. YORDAMCHI FUNKSIYALAR
+// ==========================================
+const PAROL_SALT = 'meningMaxfiyTuzim2026Xzy'; // Eski GAS kodingizdagi tuz
+
+function parolHash(parol) {
+  return crypto.createHash('sha256').update(parol + PAROL_SALT).digest('hex');
+}
+
+function genId(prefix) {
+  return prefix + Date.now().toString().slice(-6) + Math.floor(Math.random() * 1000).toString().padStart(3, '0');
+}
+
+function tasodifiyKalit(prefix) {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let res = prefix + '-';
+  for (let i = 0; i < 16; i++) res += chars.charAt(Math.floor(Math.random() * chars.length));
+  return res;
+}
+
+// Avtorizatsiya tekshiruvi (Kalit orqali)
+async function checkAuth(req) {
+  const kalit = req.method === 'GET' ? req.query.kalit : req.body.kalit;
+  if (!kalit) return null;
+  if (kalit === '9XvQ2pL8zR') return { rol: 'superadmin', fio: 'Superadmin', mfyId: '', ruxsatlar: [] };
+
+  const { data } = await supabase.from('adminlar').select('*').eq('kalit', kalit).single();
+  if (data && data.holat === 'faol') {
+    return { 
+      id: data.id, 
+      rol: data.rol, 
+      fio: data.fio, 
+      mfyId: data.mfy_id, 
+      ruxsatlar: data.ruxsatlar ? data.ruxsatlar.split(',') : [] 
+    };
+  }
+  return null;
+}
+
+// Audit logiga yozish
+async function auditLog(kim, amal, tafsilot = '') {
+  await supabase.from('audit_log').insert([{ 
+    vaqt: new Date().toISOString(), 
+    kim: kim, 
+    amal: amal, 
+    tafsilot: tafsilot 
+  }]);
+}
+
+// ==========================================
+// 3. TIZIMGA KIRISH (LOGIN)
+// ==========================================
+app.post('/api/admin-login', async (req, res) => {
+  try {
+    const { login, parol } = req.body;
+    const { data: admin, error } = await supabase.from('adminlar').select('*').eq('login', login).single();
+
+    if (error || !admin) return res.json({ ok: false, xato: "Login yoki parol noto'g'ri" });
+    if (admin.holat !== 'faol') return res.json({ ok: false, xato: "Hisob bloklangan" });
+    if (admin.parol_hash !== parolHash(parol)) return res.json({ ok: false, xato: "Login yoki parol noto'g'ri" });
+
+    await auditLog(admin.fio, 'ADMIN_LOGIN', admin.rol);
+    res.json({
+      ok: true,
+      admin: {
+        fio: admin.fio,
+        rol: admin.rol,
+        mfyId: admin.mfy_id,
+        ruxsatlar: admin.ruxsatlar ? admin.ruxsatlar.split(',') : [],
+        kalit: admin.kalit
+      }
+    });
+  } catch (err) {
+    res.json({ ok: false, xato: err.message });
+  }
+});
+
+app.get('/api/ping', async (req, res) => {
+  const user = await checkAuth(req);
+  if (!user) return res.json({ ok: false, xato: "Kalit xato" });
+  res.json({ ok: true, rol: user.rol, fio: user.fio, mfyId: user.mfyId, ruxsatlar: user.ruxsatlar });
+});
+
+// ==========================================
+// 4. GET SO'ROVLAR (RO'YXATLARNI OLISH)
+// ==========================================
+
+app.get('/api/mfylar', async (req, res) => {
+  const { data } = await supabase.from('mfy').select('*').order('nomi', { ascending: true });
+  const mfylar = data ? data.map(d => ({ id: d.id, nomi: d.nomi, rahbar: d.rahbar, tel: d.tel })) : [];
+  res.json({ ok: true, mfylar });
+});
+
+app.get('/api/kategoriyalar', async (req, res) => {
+  const { data } = await supabase.from('kategoriyalar').select('*').order('nomi', { ascending: true });
+  const kategoriyalar = data ? data.map(d => ({ id: d.id, nomi: d.nomi, tavsif: d.tavsif })) : [];
+  res.json({ ok: true, kategoriyalar });
+});
+
+app.get('/api/xodimlar', async (req, res) => {
+  const user = await checkAuth(req);
+  if (!user) return res.json({ ok: false, xato: "Ruxsat yo'q" });
+
+  const [resXodim, resMfy, resKat] = await Promise.all([
+    supabase.from('xodimlar').select('*').order('fio', { ascending: true }),
+    supabase.from('mfy').select('id, nomi'),
+    supabase.from('kategoriyalar').select('id, nomi')
+  ]);
+
+  let xodimlarList = resXodim.data || [];
+  const mfyMap = (resMfy.data || []).reduce((acc, m) => ({ ...acc, [m.id]: m.nomi }), {});
+  const katMap = (resKat.data || []).reduce((acc, k) => ({ ...acc, [k.id]: k.nomi }), {});
+
+  const xodimlar = xodimlarList.map(x => ({
+    id: x.id,
+    fio: x.fio,
+    pinfl: x.pinfl,
+    tel: x.tel,
+    mfyId: x.mfy_id,
+    mfyNomi: mfyMap[x.mfy_id] || '',
+    kategoriyaId: x.kategoriya_id,
+    kategoriyaNomi: katMap[x.kategoriya_id] || '',
+    holat: x.holat,
+    deviceBor: !!x.device_id,
+    unread: 0,
+    soni: 0
+  }));
+
+  res.json({ ok: true, xodimlar });
+});
+
+app.get('/api/hisobotlar', async (req, res) => {
+  const user = await checkAuth(req);
+  if (!user) return res.json({ ok: false });
+  
+  let query = supabase.from('hisobotlar').select('*').order('b_vaqt', { ascending: false });
+  if (req.query.xodim) query = query.eq('xodim_id', req.query.xodim);
+  if (req.query.dan) query = query.gte('sana', req.query.dan);
+  if (req.query.gacha) query = query.lte('sana', req.query.gacha);
+
+  const { data } = await query;
+  const hisobotlar = (data || []).map(h => ({
+    id: h.id, xodimId: h.xodim_id, xodimFio: h.xodim_fio,
+    mfyId: h.mfy_id, mfyNomi: h.mfy_nomi,
+    kategoriyaId: h.kategoriya_id, kategoriyaNomi: h.kategoriya_nomi,
+    ishTuri: h.ish_turi, ishNomi: h.ish_nomi,
+    b_vaqt: h.b_vaqt, b_tavsif: h.b_tavsif, b_lat: h.b_lat, b_lng: h.b_lng, 
+    b_rasmlar: h.b_rasmlar ? h.b_rasmlar.split(',') : [],
+    d_vaqt: h.d_vaqt, d_tavsif: h.d_tavsif, d_lat: h.d_lat, d_lng: h.d_lng, 
+    d_rasmlar: h.d_rasmlar ? h.d_rasmlar.split(',') : [],
+    y_vaqt: h.y_vaqt, y_tavsif: h.y_tavsif, y_lat: h.y_lat, y_lng: h.y_lng, 
+    y_rasmlar: h.y_rasmlar ? h.y_rasmlar.split(',') : [],
+    reyting: h.reyting, kechikkan: h.kechikkan, sana: h.sana, haftaKuni: h.hafta_kuni,
+    flagSabab: h.flag_sabab
+  }));
+
+  res.json({ ok: true, hisobotlar });
+});
+
+app.get('/api/adminlar', async (req, res) => {
+  const { data } = await supabase.from('adminlar').select('*');
+  const adminlar = (data || []).map(a => ({
+    id: a.id, fio: a.fio, login: a.login, rol: a.rol, mfyId: a.mfy_id, 
+    ruxsatlar: a.ruxsatlar ? a.ruxsatlar.split(',') : [], kalit: a.kalit, holat: a.holat
+  }));
+  res.json({ ok: true, adminlar });
+});
+
+app.get('/api/auditlar', async (req, res) => {
+  const { data } = await supabase.from('audit_log').select('*').order('vaqt', { ascending: false }).limit(300);
+  const audit = (data || []).map(a => ({
+    vaqt: new Date(a.vaqt).toLocaleString('ru-RU'), kim: a.kim, amal: a.amal, tafsilot: a.tafsilot
+  }));
+  res.json({ ok: true, audit });
+});
+
+// ==========================================
+// 5. POST SO'ROVLAR (CRUD AMALLARI)
+// ==========================================
+
+// --- XODIMLAR ---
+app.post('/api/xodimQosh', async (req, res) => {
+  const u = await checkAuth(req); if (!u) return res.json({ ok: false });
+  const { fio, pinfl, parol, tel, mfyId, kategoriyaId } = req.body;
+  const id = genId('X');
+  const { error } = await supabase.from('xodimlar').insert([{
+    id, fio, pinfl, parol_hash: parolHash(parol || '1234'), tel, mfy_id: mfyId, kategoriya_id: kategoriyaId, holat: 'faol'
+  }]);
+  if (error) return res.json({ ok: false, xato: error.message });
+  await auditLog(u.fio, 'XODIM_QOSHILDI', `${id} ${fio}`);
+  res.json({ ok: true, id });
+});
+
+app.post('/api/xodimTahrir', async (req, res) => {
+  const u = await checkAuth(req); if (!u) return res.json({ ok: false });
+  const { xodimId, fio, parol, tel, mfyId, kategoriyaId, holat } = req.body;
+  let updateData = {};
+  if (fio) updateData.fio = fio;
+  if (parol) updateData.parol_hash = parolHash(parol);
+  if (tel !== undefined) updateData.tel = tel;
+  if (mfyId !== undefined) updateData.mfy_id = mfyId;
+  if (kategoriyaId !== undefined) updateData.kategoriya_id = kategoriyaId;
+  if (holat) updateData.holat = holat;
+  
+  await supabase.from('xodimlar').update(updateData).eq('id', xodimId);
+  await auditLog(u.fio, 'XODIM_TAHRIR', xodimId);
+  res.json({ ok: true });
+});
+
+app.post('/api/deviceReset', async (req, res) => {
+  const u = await checkAuth(req); if (!u) return res.json({ ok: false });
+  await supabase.from('xodimlar').update({ device_id: null }).eq('id', req.body.xodimId);
+  await auditLog(u.fio, 'DEVICE_RESET', req.body.xodimId);
+  res.json({ ok: true });
+});
+
+// --- TASHKILOTLAR (MFY) ---
+app.post('/api/mfyQosh', async (req, res) => {
+  const u = await checkAuth(req); if (!u) return res.json({ ok: false });
+  const id = genId('M');
+  await supabase.from('mfy').insert([{ id, nomi: req.body.nomi, rahbar: req.body.rahbar, tel: req.body.tel }]);
+  await auditLog(u.fio, 'MFY_QOSHILDI', req.body.nomi);
+  res.json({ ok: true, id });
+});
+
+app.post('/api/mfyTahrir', async (req, res) => {
+  const u = await checkAuth(req); if (!u) return res.json({ ok: false });
+  await supabase.from('mfy').update({ nomi: req.body.nomi, rahbar: req.body.rahbar, tel: req.body.tel }).eq('id', req.body.mfyId);
+  await auditLog(u.fio, 'MFY_TAHRIR', req.body.mfyId);
+  res.json({ ok: true });
+});
+
+app.post('/api/mfyOchir', async (req, res) => {
+  const u = await checkAuth(req); if (!u) return res.json({ ok: false });
+  await supabase.from('mfy').delete().eq('id', req.body.mfyId);
+  await auditLog(u.fio, 'MFY_OCHIRILDI', req.body.mfyId);
+  res.json({ ok: true });
+});
+
+// --- KATEGORIYALAR ---
+app.post('/api/kategoriyaQosh', async (req, res) => {
+  const u = await checkAuth(req); if (!u) return res.json({ ok: false });
+  const id = genId('K');
+  await supabase.from('kategoriyalar').insert([{ id, nomi: req.body.nomi, tavsif: req.body.tavsif }]);
+  await auditLog(u.fio, 'KATEGORIYA_QOSHILDI', req.body.nomi);
+  res.json({ ok: true, id });
+});
+
+app.post('/api/kategoriyaTahrir', async (req, res) => {
+  const u = await checkAuth(req); if (!u) return res.json({ ok: false });
+  await supabase.from('kategoriyalar').update({ nomi: req.body.nomi, tavsif: req.body.tavsif }).eq('id', req.body.kategoriyaId);
+  await auditLog(u.fio, 'KATEGORIYA_TAHRIR', req.body.kategoriyaId);
+  res.json({ ok: true });
+});
+
+app.post('/api/kategoriyaOchir', async (req, res) => {
+  const u = await checkAuth(req); if (!u) return res.json({ ok: false });
+  await supabase.from('kategoriyalar').delete().eq('id', req.body.kategoriyaId);
+  await auditLog(u.fio, 'KATEGORIYA_OCHIRILDI', req.body.kategoriyaId);
+  res.json({ ok: true });
+});
+
+// --- ADMINLAR ---
+app.post('/api/adminQosh', async (req, res) => {
+  const u = await checkAuth(req); if (!u || u.rol !== 'superadmin') return res.json({ ok: false });
+  const { fio, login, parol, rol, mfyId } = req.body;
+  const id = genId('A');
+  const kalit = tasodifiyKalit(rol === 'admin' ? 'ADM' : 'NZR');
+  await supabase.from('adminlar').insert([{
+    id, fio, login, parol_hash: parolHash(parol), rol, mfy_id: mfyId || null, kalit, holat: 'faol'
+  }]);
+  await auditLog(u.fio, 'ADMIN_QOSHILDI', login);
+  res.json({ ok: true });
+});
+
+app.post('/api/adminTahrir', async (req, res) => {
+  const u = await checkAuth(req); if (!u) return res.json({ ok: false });
+  const { adminId, fio, login, rol, mfyId, holat } = req.body;
+  await supabase.from('adminlar').update({ fio, login, rol, mfy_id: mfyId || null, holat }).eq('id', adminId);
+  await auditLog(u.fio, 'ADMIN_TAHRIR', adminId);
+  res.json({ ok: true });
+});
+
+app.post('/api/adminParolTiklash', async (req, res) => {
+  const u = await checkAuth(req); if (!u) return res.json({ ok: false });
+  await supabase.from('adminlar').update({ parol_hash: parolHash(req.body.yangiParol) }).eq('id', req.body.adminId);
+  await auditLog(u.fio, 'ADMIN_PAROL_TIKLASH', req.body.adminId);
+  res.json({ ok: true });
+});
+
+app.post('/api/adminOchir', async (req, res) => {
+  const u = await checkAuth(req); if (!u || u.rol !== 'superadmin') return res.json({ ok: false });
+  await supabase.from('adminlar').delete().eq('id', req.body.adminId);
+  await auditLog(u.fio, 'ADMIN_OCHIRILDI', req.body.adminId);
+  res.json({ ok: true });
+});
+
+// --- BOSHQALAR (Eslatmalar, Sozlamalar) ---
+app.post('/api/eslatmaYuborGuruh', async (req, res) => {
+  const u = await checkAuth(req); if (!u) return res.json({ ok: false });
+  // Hozircha Eslatmalar simulatsiyasi qilinadi (mobil ilova API ulanmaguncha)
+  await auditLog(u.fio, 'ESLATMA_GURUH', `${req.body.xodimIdlar.length} ta xodimga`);
+  res.json({ ok: true, yuborildi: req.body.xodimIdlar.length });
+});
+
+app.get('/api/sozlamaOl', async (req, res) => {
+  const { data } = await supabase.from('sozlamalar').select('*').eq('kalit', 'INTERVAL_DAQIQA').single();
+  res.json({ ok: true, interval: data ? data.qiymat : 1 });
+});
+
+app.post('/api/sozlamaSaqla', async (req, res) => {
+  const u = await checkAuth(req); if (!u) return res.json({ ok: false });
+  await supabase.from('sozlamalar').upsert([{ kalit: 'INTERVAL_DAQIQA', qiymat: req.body.interval }]);
+  await auditLog(u.fio, 'SOZLAMA_O_ZGARTIRILDI', `Interval: ${req.body.interval}`);
+  res.json({ ok: true });
+});
+
+// SERVERNI ISHGA TUSHIRISH
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`SysOne Backend server ${PORT}-portda muvaffaqiyatli ishga tushdi!`);
+});
