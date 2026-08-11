@@ -334,7 +334,7 @@ app.post('/api/eslatmaYuborGuruh', async (req, res) => {
   res.json({ ok: true, yuborildi: req.body.xodimIdlar?.length || 0 });
 });
 
-// SOZLAMALAR VA BILDIRISHNOMALAR (404 larni yo'qotish uchun)
+// SOZLAMALAR VA BILDIRISHNOMALAR
 app.get('/api/sozlamaOl', async (req, res) => {
   const { data } = await supabase.from('sozlamalar').select('*').eq('kalit', 'INTERVAL_DAQIQA').single();
   res.json({ ok: true, interval: data ? data.qiymat : 1 });
@@ -528,9 +528,56 @@ app.get('/api/tahrirSorovlari', async (req, res) => {
   if (error) return res.json({ ok: false, xato: error.message });
   const sorovlar = (data || []).map(s => ({
     id: s.id, hisobotId: s.hisobot_id, xodimFio: s.xodim_fio,
-    sabab: s.sabab, status: s.status, sana: s.sana
+    sabab: s.sabab, status: s.status, ruxsatBeruvchi: s.ruxsat_beruvchi, sana: s.sana
   }));
   res.json({ ok: true, sorovlar });
+});
+
+// Tahrirga ruxsat berish
+app.post('/api/tahrirRuxsatBer', async (req, res) => {
+  const u = await checkAuth(req); 
+  if (!u) return res.json({ ok: false, xato: "Ruxsat yo'q" });
+
+  try {
+    const { sorovId } = req.body;
+    const { data: s, error: sErr } = await supabase.from('tahrir_sorovlari').select('*').eq('id', sorovId).single();
+    if (sErr || !s) return res.json({ ok: false, xato: "So'rov topilmadi" });
+
+    await supabase.from('tahrir_sorovlari').update({
+      status: 'RUXSAT_BERILDI',
+      ruxsat_beruvchi: u.fio
+    }).eq('id', sorovId);
+
+    if (s.hisobot_id) {
+      await supabase.from('hisobotlar').update({
+        bosqich: 'BOSHLANDI'
+      }).eq('id', s.hisobot_id);
+    }
+
+    await auditLog(u.fio, 'TAHRIR_RUXSAT', `${s.xodim_fio} - ${s.hisobot_id}`);
+    res.json({ ok: true });
+  } catch (err) {
+    res.json({ ok: false, xato: err.message });
+  }
+});
+
+// Tahrirni rad etish
+app.post('/api/tahrirRad', async (req, res) => {
+  const u = await checkAuth(req); 
+  if (!u) return res.json({ ok: false, xato: "Ruxsat yo'q" });
+
+  try {
+    const { sorovId } = req.body;
+    await supabase.from('tahrir_sorovlari').update({
+      status: 'RAD_ETILDI',
+      ruxsat_beruvchi: u.fio
+    }).eq('id', sorovId);
+
+    await auditLog(u.fio, 'TAHRIR_RAD', sorovId);
+    res.json({ ok: true });
+  } catch (err) {
+    res.json({ ok: false, xato: err.message });
+  }
 });
 
 // SERVERNI ISHGA TUSHIRISH
