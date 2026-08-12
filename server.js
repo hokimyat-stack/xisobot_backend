@@ -174,6 +174,7 @@ app.get('/api/xodimlar', async (req, res) => {
       kategoriyaId: x.kategoriya_id,
       kategoriyaNomi: katMap[x.kategoriya_id] || '',
       holat: x.holat,
+      ish_holati: x.ish_holati || 'ishda', // Qo'shildi
       deviceBor: !!x.device_id,
       unread: 0,
       soni: 0
@@ -206,10 +207,11 @@ app.get('/api/auditlar', async (req, res) => {
 // CRUD AMALLARI
 app.post('/api/xodimQosh', async (req, res) => {
   const u = await checkAuth(req); if (!u) return res.json({ ok: false, xato: "Ruxsat yo'q" });
-  const { fio, pinfl, parol, tel, mfyId, kategoriyaId } = req.body;
+  const { fio, pinfl, parol, tel, mfyId, kategoriyaId, ishHolati } = req.body; // ishHolati qo'shildi
   const id = genId('X');
   const { error } = await supabase.from('xodimlar').insert([{
-    id, fio, pinfl, parol_hash: parolHash(parol || '1234'), tel: tel || '', mfy_id: mfyId || null, kategoriya_id: kategoriyaId || null, holat: 'faol'
+    id, fio, pinfl, parol_hash: parolHash(parol || '1234'), tel: tel || '', mfy_id: mfyId || null, 
+    kategoriya_id: kategoriyaId || null, holat: 'faol', ish_holati: ishHolati || 'ishda' // Qo'shildi
   }]);
   if (error) return res.json({ ok: false, xato: error.message });
   await auditLog(u.fio, 'XODIM_QOSHILDI', `${id} ${fio}`);
@@ -218,7 +220,7 @@ app.post('/api/xodimQosh', async (req, res) => {
 
 app.post('/api/xodimTahrir', async (req, res) => {
   const u = await checkAuth(req); if (!u) return res.json({ ok: false, xato: "Ruxsat yo'q" });
-  const { xodimId, fio, parol, tel, mfyId, kategoriyaId, holat } = req.body;
+  const { xodimId, fio, parol, tel, mfyId, kategoriyaId, holat, ishHolati } = req.body; // ishHolati qo'shildi
   let updateData = {};
   if (fio) updateData.fio = fio;
   if (parol) updateData.parol_hash = parolHash(parol);
@@ -226,6 +228,7 @@ app.post('/api/xodimTahrir', async (req, res) => {
   if (mfyId !== undefined) updateData.mfy_id = mfyId || null;
   if (kategoriyaId !== undefined) updateData.kategoriya_id = kategoriyaId || null;
   if (holat) updateData.holat = holat;
+  if (ishHolati) updateData.ish_holati = ishHolati; // Qo'shildi
   
   const { error } = await supabase.from('xodimlar').update(updateData).eq('id', xodimId);
   if (error) return res.json({ ok: false, xato: error.message });
@@ -292,12 +295,11 @@ app.post('/api/kategoriyaOchir', async (req, res) => {
 
 app.post('/api/adminQosh', async (req, res) => {
   const u = await checkAuth(req); if (!u || u.rol !== 'superadmin') return res.json({ ok: false, xato: "Ruxsat yo'q" });
-  const { fio, login, parol, rol, mfyId, ruxsatlar } = req.body;
+  const { fio, login, parol, rol, mfyId } = req.body;
   const id = genId('A');
   const kalit = tasodifiyKalit(rol === 'admin' ? 'ADM' : 'NZR');
   const { error } = await supabase.from('adminlar').insert([{
-    id, fio, login, parol_hash: parolHash(parol), rol, mfy_id: mfyId || null, kalit, holat: 'faol',
-    ruxsatlar: ruxsatlar || ''   // "xodim_qosh,mfy_boshqar,..." ko'rinishida saqlanadi
+    id, fio, login, parol_hash: parolHash(parol), rol, mfy_id: mfyId || null, kalit, holat: 'faol'
   }]);
   if (error) return res.json({ ok: false, xato: error.message });
   await auditLog(u.fio, 'ADMIN_QOSHILDI', login);
@@ -306,18 +308,8 @@ app.post('/api/adminQosh', async (req, res) => {
 
 app.post('/api/adminTahrir', async (req, res) => {
   const u = await checkAuth(req); if (!u) return res.json({ ok: false, xato: "Ruxsat yo'q" });
-  const { adminId, fio, login, rol, mfyId, holat, parol, ruxsatlar } = req.body;
-
-  const updateData = {};
-  if (fio !== undefined) updateData.fio = fio;
-  if (login !== undefined) updateData.login = login;
-  if (rol !== undefined) updateData.rol = rol;
-  if (mfyId !== undefined) updateData.mfy_id = mfyId || null;
-  if (holat !== undefined) updateData.holat = holat;
-  if (ruxsatlar !== undefined) updateData.ruxsatlar = ruxsatlar;   // ruxsatlar checkboxlari shu yerda saqlanadi
-  if (parol) updateData.parol_hash = parolHash(parol);             // forma ichidan parol o'zgartirilsa
-
-  const { error } = await supabase.from('adminlar').update(updateData).eq('id', adminId);
+  const { adminId, fio, login, rol, mfyId, holat } = req.body;
+  const { error } = await supabase.from('adminlar').update({ fio, login, rol, mfy_id: mfyId || null, holat }).eq('id', adminId);
   if (error) return res.json({ ok: false, xato: error.message });
   await auditLog(u.fio, 'ADMIN_TAHRIR', adminId);
   res.json({ ok: true });
