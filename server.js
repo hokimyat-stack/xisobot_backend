@@ -174,7 +174,7 @@ app.get('/api/xodimlar', async (req, res) => {
       kategoriyaId: x.kategoriya_id,
       kategoriyaNomi: katMap[x.kategoriya_id] || '',
       holat: x.holat,
-      ish_holati: x.ish_holati || 'ishda', // Qo'shildi
+      ish_holati: x.ish_holati || 'ishda',
       deviceBor: !!x.device_id,
       unread: 0,
       soni: 0
@@ -207,20 +207,20 @@ app.get('/api/auditlar', async (req, res) => {
 // CRUD AMALLARI
 app.post('/api/xodimQosh', async (req, res) => {
   const u = await checkAuth(req); if (!u) return res.json({ ok: false, xato: "Ruxsat yo'q" });
-  const { fio, pinfl, parol, tel, mfyId, kategoriyaId, ishHolati } = req.body; // ishHolati qo'shildi
+  const { fio, pinfl, parol, tel, mfyId, kategoriyaId, ishHolati } = req.body;
   const id = genId('X');
   const { error } = await supabase.from('xodimlar').insert([{
     id, fio, pinfl, parol_hash: parolHash(parol || '1234'), tel: tel || '', mfy_id: mfyId || null, 
-    kategoriya_id: kategoriyaId || null, holat: 'faol', ish_holati: ishHolati || 'ishda' // Qo'shildi
+    kategoriya_id: kategoriyaId || null, holat: 'faol', ish_holati: ishHolati || 'ishda'
   }]);
   if (error) return res.json({ ok: false, xato: error.message });
-  await auditLog(u.fio, 'XODIM_QOSHILDI', `${id} ${fio}`);
+  await auditLog(u.fio, 'XODIM_QOSHILDI', `${id} - ${fio}`);
   res.json({ ok: true, id });
 });
 
 app.post('/api/xodimTahrir', async (req, res) => {
   const u = await checkAuth(req); if (!u) return res.json({ ok: false, xato: "Ruxsat yo'q" });
-  const { xodimId, fio, parol, tel, mfyId, kategoriyaId, holat, ishHolati } = req.body; // ishHolati qo'shildi
+  const { xodimId, fio, parol, tel, mfyId, kategoriyaId, holat, ishHolati } = req.body;
   let updateData = {};
   if (fio) updateData.fio = fio;
   if (parol) updateData.parol_hash = parolHash(parol);
@@ -228,7 +228,7 @@ app.post('/api/xodimTahrir', async (req, res) => {
   if (mfyId !== undefined) updateData.mfy_id = mfyId || null;
   if (kategoriyaId !== undefined) updateData.kategoriya_id = kategoriyaId || null;
   if (holat) updateData.holat = holat;
-  if (ishHolati) updateData.ish_holati = ishHolati; // Qo'shildi
+  if (ishHolati) updateData.ish_holati = ishHolati;
   
   const { error } = await supabase.from('xodimlar').update(updateData).eq('id', xodimId);
   if (error) return res.json({ ok: false, xato: error.message });
@@ -416,9 +416,11 @@ app.get('/api/hisobotlar', async (req, res) => {
   }
 });
 
+// YANGILANDI: 1 BOSQICHLI VA 3 BOSQICHLI HISOBOTNI FARQLASH MANTIG'I
 app.post('/api/hisobotBoshla', async (req, res) => {
   try {
-    const { xodimId, ishTuri, ishNomi, tavsif, lat, lng, rasmlar, deviceVaqt } = req.body;
+    const { xodimId, ishTuri, ishNomi, tavsif, lat, lng, rasmlar, deviceVaqt, isBirBosqichli } = req.body;
+    
     const { data: x } = await supabase.from('xodimlar').select('fio, mfy_id, kategoriya_id').eq('id', xodimId).single();
     const { data: m } = await supabase.from('mfy').select('nomi').eq('id', x?.mfy_id).single();
     const { data: k } = await supabase.from('kategoriyalar').select('nomi').eq('id', x?.kategoriya_id).single();
@@ -431,16 +433,32 @@ app.post('/api/hisobotBoshla', async (req, res) => {
 
     const id = genId('H');
     const sana = new Date().toISOString().slice(0, 10);
-    
-    const { error } = await supabase.from('hisobotlar').insert([{
+    const vaqt = deviceVaqt || new Date().toISOString();
+    const rasmlarStr = yuklanganRasmlar.join(',');
+
+    // Bosqich holatini aniqlash (1 bosqichli bo'lsa darhol YAKUNLANDI)
+    const bosqich = isBirBosqichli ? 'YAKUNLANDI' : 'BOSHLANDI';
+
+    const insertData = {
       id, xodim_id: xodimId, xodim_fio: x?.fio || '',
       mfy_id: x?.mfy_id || null, mfy_nomi: m?.nomi || '',
       kategoriya_id: x?.kategoriya_id || null, kategoriya_nomi: k?.nomi || '',
       ish_turi: ishTuri, ish_nomi: ishNomi,
-      b_vaqt: deviceVaqt || new Date().toISOString(), b_tavsif: tavsif,
-      b_lat: lat, b_lng: lng, b_rasmlar: yuklanganRasmlar.join(','),
-      bosqich: 'BOSHLANDI', sana, reyting: 'YASHIL'
-    }]);
+      b_vaqt: vaqt, b_tavsif: tavsif,
+      b_lat: lat, b_lng: lng, b_rasmlar: rasmlarStr,
+      bosqich: bosqich, sana, reyting: 'YASHIL'
+    };
+
+    // Agar hisobot 1 bosqichli bo'lsa, ma'lumotlarni tugatish ustunlariga (y_...) ham yozamiz
+    if (isBirBosqichli) {
+      insertData.y_vaqt = vaqt;
+      insertData.y_tavsif = tavsif;
+      insertData.y_lat = lat;
+      insertData.y_lng = lng;
+      insertData.y_rasmlar = rasmlarStr;
+    }
+
+    const { error } = await supabase.from('hisobotlar').insert([insertData]);
 
     if (error) return res.json({ ok: false, xato: error.message });
     res.json({ ok: true, id });
