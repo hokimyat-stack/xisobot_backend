@@ -12,6 +12,7 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // 1. BAZA VA XOTIRAGA ULANISH
+// (Eslatma: Yangi mustaqil SaaS loyiha bo'lgani uchun eski legacy bazalardan foydalanilmaydi)
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -90,12 +91,50 @@ async function auditLog(kim, amal, tafsilot = '') {
   }
 }
 
+// ----------------------------------------------------
+// PUSH-BILDIRISHNOMA (EXPO PUSH API)
+// ----------------------------------------------------
+async function sendExpoPush(tokens, title, body, extraData = {}) {
+  // Faqat yaroqli Expo tokenlarini ajratib olish
+  const validTokens = (tokens || []).filter(t => t && String(t).startsWith('ExponentPushToken'));
+  if (validTokens.length === 0) return 0;
+
+  const messages = validTokens.map(token => ({
+    to: token,
+    sound: 'default',
+    title: title,
+    body: body,
+    data: extraData,
+  }));
+
+  try {
+    const response = await fetch('https://exp.host/--/api/v2/push/send', {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(messages),
+    });
+    
+    if(!response.ok) {
+        console.error("Push API xatosi:", await response.text());
+    }
+    return validTokens.length;
+  } catch (err) {
+    console.error("Push jo'natish tarmog'ida xato:", err);
+    return 0;
+  }
+}
+
 // Bosh sahifa salomlashuv
 app.get('/', (req, res) => {
   res.send('🚀 SysOne Kunlik Hisobot API Serveri muvaffaqiyatli ishlamoqda!');
 });
 
+// ====================================================
 // 3. ADMIN PANEL API'LARI
+// ====================================================
 app.post('/api/admin-login', async (req, res) => {
   try {
     const { login, parol } = req.body;
@@ -199,7 +238,7 @@ app.get('/api/adminlar', async (req, res) => {
 app.get('/api/auditlar', async (req, res) => {
   const { data } = await supabase.from('audit_log').select('*').order('vaqt', { ascending: false }).limit(300);
   const audit = (data || []).map(a => ({
-    vaqt: new Date(a.vaqt).toLocaleString('ru-RU'), kim: a.kim, amal: a.amal, tafsilot: a.tafsilot
+    vaqt: new Date(a.vaqt).toLocaleString('uz-UZ'), kim: a.kim, amal: a.amal, tafsilot: a.tafsilot
   }));
   res.json({ ok: true, audit });
 });
@@ -331,11 +370,84 @@ app.post('/api/adminOchir', async (req, res) => {
   res.json({ ok: true });
 });
 
+// Eslatmani Haqiqiy Push qilib yuborish
 app.post('/api/eslatmaYuborGuruh', async (req, res) => {
   const u = await checkAuth(req); if (!u) return res.json({ ok: false, xato: "Ruxsat yo'q" });
-  await auditLog(u.fio, 'ESLATMA_GURUH', `${req.body.xodimIdlar?.length || 0} ta xodimga`);
-  res.json({ ok: true, yuborildi: req.body.xodimIdlar?.length || 0 });
+  
+  try {
+    const { xodimIdlar, matn } = req.body;
+    if (!xodimIdlar || xodimIdlar.length === 0) return res.json({ ok: false, xato: "Xodimlar tanlanmadi" });
+
+    // Bazadan tanlangan xodimlarning Push Token (device_id) larini olish
+    const { data: xodimlar } = await supabase
+      .from('xodimlar')
+      .select('device_id')
+      .in('id', xodimIdlar);
+
+    const tokens = (xodimlar || []).map(x => x.device_id).filter(Boolean);
+    const yuborildi = await sendExpoPush(tokens, 'SysOne: Yangi Eslatma', matn, { turi: 'eslatma' });
+
+    await auditLog(u.fio, 'ESLATMA_GURUH', `${yuborildi} ta qurilmaga yuborildi. Matn: ${matn}`);
+    res.json({ ok: true, yuborildi: yuborildi });
+  } catch (err) {
+    res.json({ ok: false, xato: err.message });
+  }
 });
+
+// ====================================================
+// 4. VAZIFALAR MODULI (TASK MANAGEMENT)
+// ====================================================
+app.post('/api/vazifaQosh', async (req, res) => {
+  const u = await checkAuth(req); if (!u) return res.json({ ok: false, xato: "Ruxsat yo'q" });
+  try {
+    const { xodimId, matn, muddat } = req.body;
+    const id = genId('V');
+    const sana = new Date().toISOString().slice(0, 10);
+    
+    // Xodim ma'lumotlarini olish
+    const { data: x } = await supabase.from('xodimlar').select('fio, device_id').eq('id', xodimId).single();
+    if(!x) return res.json({ok: false, xato: "Xodim topilmadi"});
+
+    const { error } = await supabase.from('vazifalar').insert([{
+      id, xodim_id: xodimId, xodim_fio: x.fio, matn, muddat: muddat || null, holat: 'kutilmoqda', sana
+    }]);
+
+    if (error) return res.json({ok: false, xato: error.message});
+
+    // Yangi vazifa bo'yicha Xodimga PUSH jo'natish
+    if (x.device_id) {
+      await sendExpoPush([x.device_id], 'Yangi Vazifa Biriktirildi', matn, { turi: 'vazifa', id });
+    }
+
+    await auditLog(u.fio, 'VAZIFA_QOSHILDI', `${x.fio} ga: ${matn}`);
+    res.json({ok: true, id});
+  } catch (err) {
+    res.json({ok: false, xato: err.message});
+  }
+});
+
+app.get('/api/vazifalar', async (req, res) => {
+  const u = await checkAuth(req); if (!u) return res.json({ ok: false, xato: "Ruxsat yo'q" });
+  try {
+    let query = supabase.from('vazifalar').select('*').order('sana', { ascending: false });
+    // Nazoratchi faqat o'z MFYsidagi vazifalarni ko'rishi uchun filter qo'shish mumkin
+    // Ammo hozircha bazaviy barcha vazifalarni qaytaramiz (frontenda filtr qilinadi)
+    const { data, error } = await query;
+    if (error) return res.json({ok: false, xato: error.message});
+    res.json({ok: true, vazifalar: data});
+  } catch (err) {
+    res.json({ok: false, xato: err.message});
+  }
+});
+
+app.post('/api/vazifaOchir', async (req, res) => {
+  const u = await checkAuth(req); if (!u) return res.json({ ok: false, xato: "Ruxsat yo'q" });
+  const { error } = await supabase.from('vazifalar').delete().eq('id', req.body.vazifaId);
+  if (error) return res.json({ ok: false, xato: error.message });
+  await auditLog(u.fio, 'VAZIFA_OCHIRILDI', req.body.vazifaId);
+  res.json({ ok: true });
+});
+
 
 // SOZLAMALAR VA BILDIRISHNOMALAR
 app.get('/api/sozlamaOl', async (req, res) => {
@@ -362,7 +474,9 @@ app.post('/api/bildirishnomaSozla', async (req, res) => {
   res.json({ ok: true });
 });
 
-// 4. MOBIL ILOVA VA HISOBOT API'LARI
+// ====================================================
+// 5. MOBIL ILOVA VA HISOBOT API'LARI
+// ====================================================
 app.post('/api/xodim-login', async (req, res) => {
   try {
     const { pinfl, parol, deviceId } = req.body;
@@ -372,16 +486,37 @@ app.post('/api/xodim-login', async (req, res) => {
     if (xodim.holat !== 'faol') return res.json({ ok: false, xato: "Hisob bloklangan" });
     if (xodim.parol_hash !== parolHash(parol)) return res.json({ ok: false, xato: "PINFL yoki parol noto'g'ri" });
 
+    // Qurilma yangilanishi va Tokenni saqlash (Push yuborish uchun)
     if (xodim.device_id && xodim.device_id !== deviceId) {
-      return res.json({ ok: false, xato: "Bu hisob boshqa qurilmaga bog'langan!" });
-    }
-    if (!xodim.device_id && deviceId) {
+      // return res.json({ ok: false, xato: "Bu hisob boshqa qurilmaga bog'langan!" });
+      // Ruxsat berish yoki bloklash o'zgartirilishi mumkin. Hozircha token o'zgarsa saqlaymiz:
+      await supabase.from('xodimlar').update({ device_id: deviceId }).eq('id', xodim.id);
+    } else if (!xodim.device_id && deviceId) {
       await supabase.from('xodimlar').update({ device_id: deviceId }).eq('id', xodim.id);
     }
 
     res.json({ ok: true, xodim: { id: xodim.id, fio: xodim.fio, mfyId: xodim.mfy_id, kategoriyaId: xodim.kategoriya_id } });
   } catch (err) {
     res.json({ ok: false, xato: err.message });
+  }
+});
+
+// Ilovaga vazifalarni yuborish
+app.get('/api/vazifalarim', async (req, res) => {
+  try {
+    const { xodimId } = req.query;
+    if (!xodimId) return res.json({ok: false, xato: "Xodim ID yo'q"});
+    
+    const { data, error } = await supabase
+      .from('vazifalar')
+      .select('*')
+      .eq('xodim_id', xodimId)
+      .order('sana', { ascending: false });
+
+    if (error) return res.json({ok: false, xato: error.message});
+    res.json({ok: true, vazifalar: data});
+  } catch (err) {
+    res.json({ok: false, xato: err.message});
   }
 });
 
@@ -407,7 +542,8 @@ app.get('/api/hisobotlar', async (req, res) => {
       y_vaqt: h.y_vaqt, y_tavsif: h.y_tavsif, y_lat: h.y_lat, y_lng: h.y_lng, 
       y_rasmlar: h.y_rasmlar ? h.y_rasmlar.split(',') : [],
       reyting: h.reyting, kechikkan: h.kechikkan, sana: h.sana, haftaKuni: h.hafta_kuni,
-      flagSabab: h.flag_sabab, bosqich: h.bosqich || 'BOSHLANDI'
+      flagSabab: h.flag_sabab, bosqich: h.bosqich || 'BOSHLANDI',
+      vazifaId: h.vazifa_id // Agar u vazifa orqali qilingan bo'lsa
     }));
 
     res.json({ ok: true, hisobotlar });
@@ -416,10 +552,10 @@ app.get('/api/hisobotlar', async (req, res) => {
   }
 });
 
-// YANGILANDI: 1 BOSQICHLI VA 3 BOSQICHLI HISOBOTNI FARQLASH MANTIG'I
+// HISOBOT BOSHLASH (1 va 3 bosqichli)
 app.post('/api/hisobotBoshla', async (req, res) => {
   try {
-    const { xodimId, ishTuri, ishNomi, tavsif, lat, lng, rasmlar, deviceVaqt, isBirBosqichli } = req.body;
+    const { xodimId, ishTuri, ishNomi, tavsif, lat, lng, rasmlar, deviceVaqt, isBirBosqichli, vazifaId } = req.body;
     
     const { data: x } = await supabase.from('xodimlar').select('fio, mfy_id, kategoriya_id').eq('id', xodimId).single();
     const { data: m } = await supabase.from('mfy').select('nomi').eq('id', x?.mfy_id).single();
@@ -436,7 +572,6 @@ app.post('/api/hisobotBoshla', async (req, res) => {
     const vaqt = deviceVaqt || new Date().toISOString();
     const rasmlarStr = yuklanganRasmlar.join(',');
 
-    // Bosqich holatini aniqlash (1 bosqichli bo'lsa darhol YAKUNLANDI)
     const bosqich = isBirBosqichli ? 'YAKUNLANDI' : 'BOSHLANDI';
 
     const insertData = {
@@ -446,10 +581,10 @@ app.post('/api/hisobotBoshla', async (req, res) => {
       ish_turi: ishTuri, ish_nomi: ishNomi,
       b_vaqt: vaqt, b_tavsif: tavsif,
       b_lat: lat, b_lng: lng, b_rasmlar: rasmlarStr,
-      bosqich: bosqich, sana, reyting: 'YASHIL'
+      bosqich: bosqich, sana, reyting: 'YASHIL',
+      vazifa_id: vazifaId || null
     };
 
-    // Agar hisobot 1 bosqichli bo'lsa, ma'lumotlarni tugatish ustunlariga (y_...) ham yozamiz
     if (isBirBosqichli) {
       insertData.y_vaqt = vaqt;
       insertData.y_tavsif = tavsif;
@@ -459,8 +594,13 @@ app.post('/api/hisobotBoshla', async (req, res) => {
     }
 
     const { error } = await supabase.from('hisobotlar').insert([insertData]);
-
     if (error) return res.json({ ok: false, xato: error.message });
+
+    // Agar hisobot bitta vazifaga ulangan bo'lsa va u YAKUNLANGAN bo'lsa, vazifani statusini o'zgartiramiz
+    if (vazifaId && isBirBosqichli) {
+      await supabase.from('vazifalar').update({ holat: 'bajarildi' }).eq('id', vazifaId);
+    }
+
     res.json({ ok: true, id });
   } catch (err) {
     res.json({ ok: false, xato: err.message });
@@ -491,7 +631,7 @@ app.post('/api/hisobotDavom', async (req, res) => {
 
 app.post('/api/hisobotYakun', async (req, res) => {
   try {
-    const { hisobotId, tavsif, lat, lng, rasmlar, deviceVaqt } = req.body;
+    const { hisobotId, tavsif, lat, lng, rasmlar, deviceVaqt, vazifaId } = req.body;
     let yuklanganRasmlar = [];
     for (let rB64 of (rasmlar || [])) {
       const url = await r2RasmYukla(rB64);
@@ -505,6 +645,12 @@ app.post('/api/hisobotYakun', async (req, res) => {
     }).eq('id', hisobotId);
 
     if (error) return res.json({ ok: false, xato: error.message });
+
+    // Agar hisobot vazifa asosida ochilgan bo'lsa, uni bajarildi deb belgilaymiz
+    if (vazifaId) {
+      await supabase.from('vazifalar').update({ holat: 'bajarildi' }).eq('id', vazifaId);
+    }
+
     res.json({ ok: true });
   } catch (err) {
     res.json({ ok: false, xato: err.message });
@@ -554,7 +700,6 @@ app.get('/api/tahrirSorovlari', async (req, res) => {
   res.json({ ok: true, sorovlar });
 });
 
-// Tahrirga ruxsat berish
 app.post('/api/tahrirRuxsatBer', async (req, res) => {
   const u = await checkAuth(req); 
   if (!u) return res.json({ ok: false, xato: "Ruxsat yo'q" });
@@ -570,9 +715,7 @@ app.post('/api/tahrirRuxsatBer', async (req, res) => {
     }).eq('id', sorovId);
 
     if (s.hisobot_id) {
-      await supabase.from('hisobotlar').update({
-        bosqich: 'BOSHLANDI'
-      }).eq('id', s.hisobot_id);
+      await supabase.from('hisobotlar').update({ bosqich: 'BOSHLANDI' }).eq('id', s.hisobot_id);
     }
 
     await auditLog(u.fio, 'TAHRIR_RUXSAT', `${s.xodim_fio} - ${s.hisobot_id}`);
@@ -582,7 +725,6 @@ app.post('/api/tahrirRuxsatBer', async (req, res) => {
   }
 });
 
-// Tahrirni rad etish
 app.post('/api/tahrirRad', async (req, res) => {
   const u = await checkAuth(req); 
   if (!u) return res.json({ ok: false, xato: "Ruxsat yo'q" });
