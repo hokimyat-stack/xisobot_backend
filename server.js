@@ -28,10 +28,16 @@ const s3 = new S3Client({
 });
 
 // 2. YORDAMCHI FUNKSIYALAR
-const PAROL_SALT = 'meningMaxfiyTuzim2026Xzy';
+// PAROL_SALT ning eski qiymati fallback sifatida SAQLANADI.
+// Shu sabab bazadagi mavjud admin/xodim parollari buzilmaydi.
+const PAROL_SALT = process.env.PAROL_SALT || 'meningMaxfiyTuzim2026Xzy';
+
+// Backward compatibility: eski superadmin kaliti ham ishlashda davom etadi.
+const LEGACY_SUPERADMIN_KEY = '9XvQ2pL8zR';
+const SUPERADMIN_KEY = process.env.SUPERADMIN_KEY || LEGACY_SUPERADMIN_KEY;
 
 function parolHash(parol) {
-  return crypto.createHash('sha256').update(parol + PAROL_SALT).digest('hex');
+  return crypto.createHash('sha256').update(String(parol || '') + PAROL_SALT).digest('hex');
 }
 
 function genId(prefix) {
@@ -43,6 +49,112 @@ function tasodifiyKalit(prefix) {
   let res = prefix + '-';
   for (let i = 0; i < 16; i++) res += chars.charAt(Math.floor(Math.random() * chars.length));
   return res;
+}
+
+function ruxsatlarniParse(qiymat) {
+  if (!qiymat) return [];
+  if (Array.isArray(qiymat)) return qiymat.map(String).map(x => x.trim()).filter(Boolean);
+
+  const text = String(qiymat).trim();
+  if (!text) return [];
+
+  if (text.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed)) return parsed.map(String).map(x => x.trim()).filter(Boolean);
+    } catch (_) {}
+  }
+
+  return text.split(',').map(x => x.trim()).filter(Boolean);
+}
+
+function ruxsatlarniSaqlashFormat(qiymat) {
+  return ruxsatlarniParse(qiymat).join(',');
+}
+
+function tashkentBugun() {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Tashkent',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).formatToParts(new Date());
+
+  const map = Object.fromEntries(parts.map(p => [p.type, p.value]));
+  return `${map.year}-${map.month}-${map.day}`;
+}
+
+function sanaQosh(isoDate, days = 0) {
+  const [y, m, d] = String(isoDate).split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + Number(days || 0));
+  return dt.toISOString().slice(0, 10);
+}
+
+function normalizeUzbek(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/[ʻ‘’`´]/g, "'")
+    .replace(/o'/g, 'o')
+    .replace(/g'/g, 'g')
+    .replace(/[^a-z0-9а-яёқғҳў\s-]/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function tokenStem(token) {
+  let t = normalizeUzbek(token);
+  if (t.length > 6 && t.endsWith('lari')) t = t.slice(0, -4);
+  else if (t.length > 5 && t.endsWith('lar')) t = t.slice(0, -3);
+  if (t.length > 5 && t.endsWith('si')) t = t.slice(0, -2);
+  if (t.length > 6 && t.endsWith('ning')) t = t.slice(0, -4);
+  return t;
+}
+
+function entityMatch(savol, list) {
+  const q = normalizeUzbek(savol);
+  const qTokens = q.split(' ').map(tokenStem).filter(Boolean);
+  let best = null;
+  let bestScore = 0;
+
+  for (const item of (list || [])) {
+    const nom = normalizeUzbek(item?.nomi);
+    if (!nom) continue;
+
+    if (q.includes(nom)) {
+      const score = 1000 + nom.length;
+      if (score > bestScore) { bestScore = score; best = item; }
+      continue;
+    }
+
+    const tokens = nom.split(' ').map(tokenStem).filter(t => t.length >= 2);
+    if (!tokens.length) continue;
+
+    let mos = 0;
+    for (const token of tokens) {
+      if (qTokens.some(qt => qt === token || (qt.length >= 4 && token.startsWith(qt)) || (token.length >= 4 && qt.startsWith(token)))) mos++;
+    }
+
+    const score = (mos / tokens.length) * 100;
+    if (score > bestScore) { bestScore = score; best = item; }
+  }
+
+  return bestScore >= 55 ? best : null;
+}
+
+function savoldanSanaOl(savol) {
+  const raw = String(savol || '');
+  const q = normalizeUzbek(raw);
+
+  if (q.includes('kecha')) return sanaQosh(tashkentBugun(), -1);
+
+  let m = raw.match(/\b(20\d{2})-(\d{2})-(\d{2})\b/);
+  if (m) return m[0];
+
+  m = raw.match(/\b(\d{1,2})[.\/-](\d{1,2})[.\/-](20\d{2})\b/);
+  if (m) return `${m[3]}-${String(m[2]).padStart(2, '0')}-${String(m[1]).padStart(2, '0')}`;
+
+  return tashkentBugun();
 }
 
 async function r2RasmYukla(base64Data, folder = 'reports') {
@@ -61,22 +173,52 @@ async function r2RasmYukla(base64Data, folder = 'reports') {
 }
 
 async function checkAuth(req) {
-  const kalit = req.method === 'GET' ? req.query.kalit : req.body.kalit;
-  if (!kalit) return null;
-  if (kalit === '9XvQ2pL8zR') return { rol: 'superadmin', fio: 'Superadmin', mfyId: '', ruxsatlar: [] };
+  try {
+    const kalit = req.method === 'GET' ? req.query?.kalit : req.body?.kalit;
+    if (!kalit) return null;
 
-  const { data } = await supabase.from('adminlar').select('*').eq('kalit', kalit).single();
-  if (data && data.holat === 'faol') {
-    return { 
-      id: data.id, 
-      rol: data.rol, 
-      fio: data.fio, 
-      mfyId: data.mfy_id, 
-      ruxsatlar: data.ruxsatlar ? data.ruxsatlar.split(',') : [] 
-    };
+    // Eski va yangi superadmin kaliti bir vaqtda qo'llanadi.
+    if (kalit === LEGACY_SUPERADMIN_KEY || kalit === SUPERADMIN_KEY) {
+      return {
+        id: 'superadmin',
+        rol: 'superadmin',
+        fio: 'Superadmin',
+        mfyId: '',
+        ruxsatlar: [
+          'xodim_qosh', 'xodim_tahrir', 'xodim_blok', 'eslatma_yuborish',
+          'mfy_boshqar', 'kategoriya_boshqar', 'excel_export', 'sozlamalar'
+        ]
+      };
+    }
+
+    const { data, error } = await supabase
+      .from('adminlar')
+      .select('*')
+      .eq('kalit', kalit)
+      .maybeSingle();
+
+    if (error) {
+      console.error('AUTH SUPABASE XATOSI:', error.message);
+      return null;
+    }
+
+    if (data && data.holat === 'faol') {
+      return {
+        id: data.id,
+        rol: data.rol,
+        fio: data.fio,
+        mfyId: data.mfy_id,
+        ruxsatlar: ruxsatlarniParse(data.ruxsatlar)
+      };
+    }
+
+    return null;
+  } catch (err) {
+    console.error('checkAuth xatosi:', err);
+    return null;
   }
-  return null;
 }
+
 
 async function auditLog(kim, amal, tafsilot = '') {
   try {
@@ -151,7 +293,7 @@ app.post('/api/admin-login', async (req, res) => {
         fio: admin.fio,
         rol: admin.rol,
         mfyId: admin.mfy_id,
-        ruxsatlar: admin.ruxsatlar ? admin.ruxsatlar.split(',') : [],
+        ruxsatlar: ruxsatlarniParse(admin.ruxsatlar),
         kalit: admin.kalit
       }
     });
@@ -230,7 +372,7 @@ app.get('/api/adminlar', async (req, res) => {
   if (error) return res.json({ ok: false, xato: error.message });
   const adminlar = (data || []).map(a => ({
     id: a.id, fio: a.fio, login: a.login, rol: a.rol, mfyId: a.mfy_id, 
-    ruxsatlar: a.ruxsatlar ? a.ruxsatlar.split(',') : [], kalit: a.kalit, holat: a.holat
+    ruxsatlar: ruxsatlarniParse(a.ruxsatlar), kalit: a.kalit, holat: a.holat
   }));
   res.json({ ok: true, adminlar });
 });
@@ -334,11 +476,12 @@ app.post('/api/kategoriyaOchir', async (req, res) => {
 
 app.post('/api/adminQosh', async (req, res) => {
   const u = await checkAuth(req); if (!u || u.rol !== 'superadmin') return res.json({ ok: false, xato: "Ruxsat yo'q" });
-  const { fio, login, parol, rol, mfyId } = req.body;
+  const { fio, login, parol, rol, mfyId, ruxsatlar } = req.body;
   const id = genId('A');
   const kalit = tasodifiyKalit(rol === 'admin' ? 'ADM' : 'NZR');
   const { error } = await supabase.from('adminlar').insert([{
-    id, fio, login, parol_hash: parolHash(parol), rol, mfy_id: mfyId || null, kalit, holat: 'faol'
+    id, fio, login, parol_hash: parolHash(parol), rol, mfy_id: mfyId || null,
+    ruxsatlar: ruxsatlarniSaqlashFormat(ruxsatlar), kalit, holat: 'faol'
   }]);
   if (error) return res.json({ ok: false, xato: error.message });
   await auditLog(u.fio, 'ADMIN_QOSHILDI', login);
@@ -347,8 +490,17 @@ app.post('/api/adminQosh', async (req, res) => {
 
 app.post('/api/adminTahrir', async (req, res) => {
   const u = await checkAuth(req); if (!u) return res.json({ ok: false, xato: "Ruxsat yo'q" });
-  const { adminId, fio, login, rol, mfyId, holat } = req.body;
-  const { error } = await supabase.from('adminlar').update({ fio, login, rol, mfy_id: mfyId || null, holat }).eq('id', adminId);
+  const { adminId, fio, login, rol, mfyId, holat, parol, ruxsatlar } = req.body;
+  const updateData = {};
+  if (fio !== undefined) updateData.fio = fio;
+  if (login !== undefined) updateData.login = login;
+  if (rol !== undefined) updateData.rol = rol;
+  if (mfyId !== undefined) updateData.mfy_id = mfyId || null;
+  if (holat !== undefined) updateData.holat = holat;
+  if (parol) updateData.parol_hash = parolHash(parol);
+  if (ruxsatlar !== undefined) updateData.ruxsatlar = ruxsatlarniSaqlashFormat(ruxsatlar);
+
+  const { error } = await supabase.from('adminlar').update(updateData).eq('id', adminId);
   if (error) return res.json({ ok: false, xato: error.message });
   await auditLog(u.fio, 'ADMIN_TAHRIR', adminId);
   res.json({ ok: true });
@@ -402,7 +554,7 @@ app.post('/api/vazifaQosh', async (req, res) => {
   try {
     const { xodimId, matn, muddat } = req.body;
     const id = genId('V');
-    const sana = new Date().toISOString().slice(0, 10);
+    const sana = tashkentBugun();
     
     // Xodim ma'lumotlarini olish
     const { data: x } = await supabase.from('xodimlar').select('fio, device_id').eq('id', xodimId).single();
@@ -568,7 +720,7 @@ app.post('/api/hisobotBoshla', async (req, res) => {
     }
 
     const id = genId('H');
-    const sana = new Date().toISOString().slice(0, 10);
+    const sana = tashkentBugun();
     const vaqt = deviceVaqt || new Date().toISOString();
     const rasmlarStr = yuklanganRasmlar.join(',');
 
@@ -676,7 +828,7 @@ app.post('/api/tahrirSora', async (req, res) => {
   try {
     const { hisobotId, xodimId, xodimFio, sabab } = req.body;
     const id = genId('T');
-    const sana = new Date().toISOString().slice(0, 10);
+    const sana = tashkentBugun();
 
     const { error } = await supabase.from('tahrir_sorovlari').insert([{
       id, hisobot_id: hisobotId, xodim_id: xodimId, xodim_fio: xodimFio,
@@ -740,6 +892,579 @@ app.post('/api/tahrirRad', async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     res.json({ ok: false, xato: err.message });
+  }
+});
+
+// ====================================================
+// 6. DASHBOARD 4.0 + SYSONE AI ANALYST
+// ====================================================
+// Muhim prinsip: AI statistikani hisoblamaydi.
+// Raqamlar Supabase ma'lumotlaridan serverda deterministik hisoblanadi,
+// AI esa faqat shu aniq faktlarni ravon o'zbek tilida sharhlaydi.
+
+const aiRateLimitMap = new Map();
+const aiCache = new Map();
+
+function aiRateRuxsat(userId) {
+  const key = String(userId || 'unknown');
+  const now = Date.now();
+  const old = (aiRateLimitMap.get(key) || []).filter(t => now - t < 60_000);
+  if (old.length >= 12) return false;
+  old.push(now);
+  aiRateLimitMap.set(key, old);
+  return true;
+}
+
+async function dashboardSnapshotYarat(user, options = {}) {
+  const targetSana = options.sana || tashkentBugun();
+  const kunlar = Math.max(7, Math.min(30, Number(options.kunlar || 14)));
+  const boshlanish = sanaQosh(targetSana, -(kunlar - 1));
+
+  let mfyId = options.mfyId || '';
+  const kategoriyaId = options.kategoriyaId || '';
+
+  // Nazoratchi server darajasida faqat o'z tashkilotini ko'radi.
+  if (user.rol === 'nazoratchi') mfyId = String(user.mfyId || '');
+
+  let xQuery = supabase
+    .from('xodimlar')
+    .select('id,fio,mfy_id,kategoriya_id,holat,ish_holati');
+
+  if (mfyId) xQuery = xQuery.eq('mfy_id', mfyId);
+  if (kategoriyaId) xQuery = xQuery.eq('kategoriya_id', kategoriyaId);
+
+  let hQuery = supabase
+    .from('hisobotlar')
+    .select('id,xodim_id,xodim_fio,mfy_id,mfy_nomi,kategoriya_id,kategoriya_nomi,ish_turi,ish_nomi,reyting,kechikkan,sana,b_vaqt,bosqich')
+    .gte('sana', boshlanish)
+    .lte('sana', targetSana)
+    .order('b_vaqt', { ascending: false });
+
+  if (mfyId) hQuery = hQuery.eq('mfy_id', mfyId);
+  if (kategoriyaId) hQuery = hQuery.eq('kategoriya_id', kategoriyaId);
+
+  const [xRes, hRes, mRes, kRes] = await Promise.all([
+    xQuery,
+    hQuery,
+    supabase.from('mfy').select('id,nomi'),
+    supabase.from('kategoriyalar').select('id,nomi')
+  ]);
+
+  if (xRes.error) throw xRes.error;
+  if (hRes.error) throw hRes.error;
+  if (mRes.error) throw mRes.error;
+  if (kRes.error) throw kRes.error;
+
+  const mfyMap = Object.fromEntries((mRes.data || []).map(x => [String(x.id), x.nomi]));
+  const katMap = Object.fromEntries((kRes.data || []).map(x => [String(x.id), x.nomi]));
+
+  const xodimlar = (xRes.data || []).map(x => ({
+    id: x.id,
+    fio: x.fio,
+    mfyId: x.mfy_id,
+    mfyNomi: mfyMap[String(x.mfy_id)] || '',
+    kategoriyaId: x.kategoriya_id,
+    kategoriyaNomi: katMap[String(x.kategoriya_id)] || '',
+    holat: x.holat,
+    ishHolati: x.ish_holati || 'ishda'
+  }));
+
+  const faol = xodimlar.filter(x => x.holat === 'faol');
+  const bloklangan = xodimlar.length - faol.length;
+  const hisobotlar = hRes.data || [];
+  const bugungiHisobotlar = hisobotlar.filter(h => h.sana === targetSana);
+  const topshirganIds = new Set(bugungiHisobotlar.map(h => String(h.xodim_id)));
+
+  const topshirgan = faol.filter(x => topshirganIds.has(String(x.id)));
+  const qolgan = faol.filter(x => !topshirganIds.has(String(x.id)));
+  const uzrli = qolgan.filter(x => x.ishHolati && x.ishHolati !== 'ishda');
+  const topshirmagan = qolgan.filter(x => !x.ishHolati || x.ishHolati === 'ishda');
+
+  const kutilgan = Math.max(0, faol.length - uzrli.length);
+  const bajarilishFoizi = kutilgan > 0 ? Math.round((topshirgan.length / kutilgan) * 100) : 0;
+  const flagSoni = bugungiHisobotlar.filter(h => h.reyting && h.reyting !== 'YASHIL').length;
+  const kechikkan = bugungiHisobotlar.filter(h => !!h.kechikkan).length;
+  const flagFoizi = bugungiHisobotlar.length ? Math.round((flagSoni / bugungiHisobotlar.length) * 100) : 0;
+
+  const kecha = sanaQosh(targetSana, -1);
+  const kechaIds = new Set(
+    hisobotlar.filter(h => h.sana === kecha).map(h => String(h.xodim_id))
+  );
+  const kechagiTopshirgan = faol.filter(x => kechaIds.has(String(x.id))).length;
+  const kechagiFoiz = kutilgan > 0 ? Math.round((kechagiTopshirgan / kutilgan) * 100) : 0;
+
+  const trend = [];
+  for (let i = kunlar - 1; i >= 0; i--) {
+    const sana = sanaQosh(targetSana, -i);
+    const kunHisobot = hisobotlar.filter(h => h.sana === sana);
+    const uniq = new Set(kunHisobot.map(h => String(h.xodim_id)));
+    const kunTopshirgan = faol.filter(x => uniq.has(String(x.id))).length;
+
+    trend.push({
+      sana,
+      hisobotSoni: kunHisobot.length,
+      topshirgan: kunTopshirgan,
+      foiz: kutilgan > 0 ? Math.round((kunTopshirgan / kutilgan) * 100) : 0,
+      flagSoni: kunHisobot.filter(h => h.reyting && h.reyting !== 'YASHIL').length,
+      kechikkan: kunHisobot.filter(h => !!h.kechikkan).length
+    });
+  }
+
+  const orgMap = {};
+
+  for (const x of faol) {
+    const id = String(x.mfyId || '');
+    if (!id) continue;
+
+    if (!orgMap[id]) {
+      orgMap[id] = {
+        id,
+        nomi: x.mfyNomi || mfyMap[id] || 'Noma’lum',
+        jami: 0,
+        kutilgan: 0,
+        uzrli: 0,
+        topshirganSet: new Set(),
+        hisobotSoni: 0,
+        flagSoni: 0,
+        kechikkan: 0
+      };
+    }
+
+    const o = orgMap[id];
+    o.jami++;
+
+    if (topshirganIds.has(String(x.id))) {
+      o.topshirganSet.add(String(x.id));
+      o.kutilgan++;
+    } else if (x.ishHolati && x.ishHolati !== 'ishda') {
+      o.uzrli++;
+    } else {
+      o.kutilgan++;
+    }
+  }
+
+  for (const h of bugungiHisobotlar) {
+    const id = String(h.mfy_id || '');
+    if (!id || !orgMap[id]) continue;
+
+    orgMap[id].hisobotSoni++;
+    if (h.reyting && h.reyting !== 'YASHIL') orgMap[id].flagSoni++;
+    if (h.kechikkan) orgMap[id].kechikkan++;
+  }
+
+  const tashkilotlar = Object.values(orgMap)
+    .map(o => {
+      const submitted = o.topshirganSet.size;
+      return {
+        id: o.id,
+        nomi: o.nomi,
+        jami: o.jami,
+        kutilgan: o.kutilgan,
+        topshirgan: submitted,
+        topshirmagan: Math.max(0, o.kutilgan - submitted),
+        hisobotSoni: o.hisobotSoni,
+        uzrli: o.uzrli,
+        flagSoni: o.flagSoni,
+        kechikkan: o.kechikkan,
+        foiz: o.kutilgan > 0 ? Math.round((submitted / o.kutilgan) * 100) : 0
+      };
+    })
+    .sort((a, b) => b.foiz - a.foiz || a.nomi.localeCompare(b.nomi, 'uz'));
+
+  return {
+    sana: targetSana,
+    davr: { dan: boshlanish, gacha: targetSana, kunlar },
+    scope: {
+      mfyId: mfyId || null,
+      kategoriyaId: kategoriyaId || null,
+      nomi: mfyId ? (mfyMap[String(mfyId)] || 'Tanlangan tashkilot') : 'Barcha tashkilotlar',
+      kategoriyaNomi: kategoriyaId ? (katMap[String(kategoriyaId)] || '') : ''
+    },
+    metrics: {
+      jamiXodim: faol.length,
+      bloklangan,
+      kutilgan,
+      topshirgan: topshirgan.length,
+      topshirmagan: topshirmagan.length,
+      uzrli: uzrli.length,
+      hisobotSoni: bugungiHisobotlar.length,
+      bajarilishFoizi,
+      flagSoni,
+      flagFoizi,
+      kechikkan,
+      kechagiTopshirganFarqi: topshirgan.length - kechagiTopshirgan,
+      kechagiBajarilishFarqi: bajarilishFoizi - kechagiFoiz
+    },
+    xodimlar: {
+      topshirgan: topshirgan.map(x => ({
+        id: x.id, fio: x.fio, mfyId: x.mfyId, mfyNomi: x.mfyNomi,
+        kategoriyaId: x.kategoriyaId, kategoriyaNomi: x.kategoriyaNomi, ishHolati: x.ishHolati
+      })),
+      topshirmagan: topshirmagan.map(x => ({
+        id: x.id, fio: x.fio, mfyId: x.mfyId, mfyNomi: x.mfyNomi,
+        kategoriyaId: x.kategoriyaId, kategoriyaNomi: x.kategoriyaNomi, ishHolati: x.ishHolati
+      })),
+      uzrli: uzrli.map(x => ({
+        id: x.id, fio: x.fio, mfyId: x.mfyId, mfyNomi: x.mfyNomi,
+        kategoriyaId: x.kategoriyaId, kategoriyaNomi: x.kategoriyaNomi, ishHolati: x.ishHolati
+      }))
+    },
+    trend,
+    tashkilotlar
+  };
+}
+
+// Dashboard frontendining yangi endpointi.
+app.get('/api/dashboardSnapshot', async (req, res) => {
+  const user = await checkAuth(req);
+  if (!user) return res.status(401).json({ ok: false, xato: "Ruxsat yo'q" });
+
+  try {
+    const snapshot = await dashboardSnapshotYarat(user, {
+      mfyId: req.query.mfyId,
+      kategoriyaId: req.query.kategoriyaId,
+      kunlar: req.query.kunlar,
+      sana: req.query.sana
+    });
+    res.json({ ok: true, snapshot });
+  } catch (err) {
+    console.error('dashboardSnapshot xatosi:', err);
+    res.status(500).json({ ok: false, xato: err.message });
+  }
+});
+
+async function aiFaktlarYarat(user, savol, body = {}) {
+  const [katRes, mfyRes] = await Promise.all([
+    supabase.from('kategoriyalar').select('id,nomi'),
+    supabase.from('mfy').select('id,nomi')
+  ]);
+
+  if (katRes.error) throw katRes.error;
+  if (mfyRes.error) throw mfyRes.error;
+
+  const kategoriyalar = katRes.data || [];
+  const tashkilotlar = mfyRes.data || [];
+
+  let kategoriya = null;
+  if (body.kategoriyaId) {
+    kategoriya = kategoriyalar.find(x => String(x.id) === String(body.kategoriyaId)) || null;
+  } else {
+    kategoriya = entityMatch(savol, kategoriyalar);
+  }
+
+  let tashkilot = null;
+  if (user.rol === 'nazoratchi') {
+    tashkilot = tashkilotlar.find(x => String(x.id) === String(user.mfyId)) || null;
+  } else if (body.mfyId) {
+    tashkilot = tashkilotlar.find(x => String(x.id) === String(body.mfyId)) || null;
+  } else {
+    tashkilot = entityMatch(savol, tashkilotlar);
+  }
+
+  const sana = savoldanSanaOl(savol);
+  const snapshot = await dashboardSnapshotYarat(user, {
+    sana,
+    kunlar: Number(body.kunlar || 14),
+    kategoriyaId: kategoriya?.id || body.kategoriyaId || '',
+    mfyId: tashkilot?.id || body.mfyId || ''
+  });
+
+  const q = normalizeUzbek(savol);
+  const missingWords = ['yuklamagan', 'topshirmagan', 'yubormagan', 'bermagan', 'yuklamadi', 'topshirmadi', 'yubormadi'];
+  const submittedWords = ['yuklagan', 'topshirgan', 'yuborgan', 'bergan', 'yuklashdi', 'topshirishdi', 'yuborishdi', 'yukladi', 'topshirdi', 'yubordi'];
+  const wantsMissing = missingWords.some(w => q.includes(w));
+  const wantsSubmitted = submittedWords.some(w => q.includes(w));
+
+  let intent = 'daily_summary';
+  if (wantsMissing && kategoriya) intent = 'category_missing';
+  else if (kategoriya) intent = 'category_summary';
+  else if (wantsMissing) intent = 'missing_summary';
+  else if (wantsSubmitted) intent = 'submitted_summary';
+
+  // AI ga xodim FIO, PINFL, telefon, GPS yoki rasm berilmaydi.
+  const safeTashkilotlar = (snapshot.tashkilotlar || []).map(x => ({
+    nomi: x.nomi,
+    jami: x.jami,
+    kutilgan: x.kutilgan,
+    topshirgan: x.topshirgan,
+    topshirmagan: x.topshirmagan,
+    hisobotSoni: x.hisobotSoni,
+    uzrli: x.uzrli,
+    foiz: x.foiz,
+    flagSoni: x.flagSoni,
+    kechikkan: x.kechikkan
+  }));
+
+  return {
+    intent,
+    sana,
+    kategoriya: kategoriya ? { id: kategoriya.id, nomi: kategoriya.nomi } : null,
+    tashkilot: tashkilot ? { id: tashkilot.id, nomi: tashkilot.nomi } : null,
+    metrics: snapshot.metrics,
+    tashkilotlar: safeTashkilotlar,
+    trend: snapshot.trend
+  };
+}
+
+function sanaOvozMatni(sana) {
+  if (sana === tashkentBugun()) return 'Bugun';
+  if (sana === sanaQosh(tashkentBugun(), -1)) return 'Kecha';
+  return sana;
+}
+
+function aiAniqJavob(facts) {
+  const m = facts.metrics || {};
+  const sanaSoz = sanaOvozMatni(facts.sana);
+  const kategoriya = facts.kategoriya?.nomi || 'barcha kategoriyalar';
+  const scopeOrg = facts.tashkilot?.nomi ? ` ${facts.tashkilot.nomi} tashkilotida` : '';
+
+  const muammoliOrg = (facts.tashkilotlar || [])
+    .filter(x => Number(x.topshirmagan || 0) > 0)
+    .sort((a, b) => Number(b.topshirmagan || 0) - Number(a.topshirmagan || 0));
+
+  const topMissing = muammoliOrg.slice(0, 10);
+
+  if (facts.intent === 'category_missing') {
+    let text = `${sanaSoz}${scopeOrg} ${kategoriya} kategoriyasi bo'yicha ${muammoliOrg.length} ta tashkilotda hisobot topshirmagan xodimlar mavjud. ` +
+      `Jami ${m.topshirmagan || 0} nafar xodim hisobot topshirmagan.`;
+
+    if (topMissing.length) {
+      text += ' Tashkilotlar kesimida: ' + topMissing
+        .map(x => `${x.nomi} — ${x.topshirmagan} ta`)
+        .join('; ') + '.';
+    }
+    return text;
+  }
+
+  if (facts.intent === 'category_summary') {
+    return `${sanaSoz}${scopeOrg} ${kategoriya} kategoriyasida ${m.topshirgan || 0} nafar xodim kamida bitta hisobot topshirdi. ` +
+      `Ular jami ${m.hisobotSoni || 0} ta hisobot yukladi. ${m.topshirmagan || 0} nafar xodim hisobot topshirmagan, ` +
+      `${m.uzrli || 0} nafar xodim sababli holatda. Bajarilish darajasi ${m.bajarilishFoizi || 0} foiz.`;
+  }
+
+  if (facts.intent === 'missing_summary') {
+    let text = `${sanaSoz}${scopeOrg} jami ${m.topshirmagan || 0} nafar faol xodim hisobot topshirmagan. ` +
+      `Bu holat ${muammoliOrg.length} ta tashkilotda kuzatilmoqda.`;
+
+    if (topMissing.length) {
+      text += ' Eng ko\'p topshirmagan tashkilotlar: ' + topMissing.slice(0, 5)
+        .map(x => `${x.nomi} — ${x.topshirmagan} ta`)
+        .join('; ') + '.';
+    }
+    return text;
+  }
+
+  if (facts.intent === 'submitted_summary') {
+    return `${sanaSoz}${scopeOrg} ${m.topshirgan || 0} nafar xodim hisobot topshirdi. ` +
+      `Jami ${m.hisobotSoni || 0} ta hisobot qabul qilindi. Bajarilish darajasi ${m.bajarilishFoizi || 0} foiz. ` +
+      `${m.topshirmagan || 0} nafar xodim hali hisobot topshirmagan.`;
+  }
+
+  return `${sanaSoz}${scopeOrg}gi kunlik nazorat hisoboti. Jami ${m.jamiXodim || 0} nafar faol xodim mavjud. ` +
+    `${m.topshirgan || 0} nafari hisobot topshirdi va jami ${m.hisobotSoni || 0} ta hisobot qabul qilindi. ` +
+    `${m.topshirmagan || 0} nafar xodim hisobot topshirmagan, ${m.uzrli || 0} nafar xodim sababli holatda. ` +
+    `Bajarilish darajasi ${m.bajarilishFoizi || 0} foiz. ${m.flagSoni || 0} ta muammoli va ${m.kechikkan || 0} ta kechikkan hisobot mavjud.`;
+}
+
+function lokalTahlil(facts, exactAnswer) {
+  const m = facts.metrics || {};
+  let holat = 'yaxshi';
+  if (Number(m.bajarilishFoizi || 0) < 50) holat = 'xavf';
+  else if (Number(m.bajarilishFoizi || 0) < 80 || Number(m.flagSoni || 0) > 0) holat = 'diqqat';
+
+  const insights = [{
+    sarlavha: 'Bajarilish',
+    matn: `Joriy bajarilish darajasi ${m.bajarilishFoizi || 0} foiz.`,
+    daraja: Number(m.bajarilishFoizi || 0) >= 80 ? 'past' : (Number(m.bajarilishFoizi || 0) >= 50 ? 'orta' : 'yuqori')
+  }];
+
+  if (Number(m.topshirmagan || 0) > 0) {
+    insights.push({
+      sarlavha: 'Topshirmaganlar',
+      matn: `${m.topshirmagan} nafar xodim hisobot topshirmagan.`,
+      daraja: 'orta'
+    });
+  }
+
+  if (Number(m.flagSoni || 0) > 0) {
+    insights.push({
+      sarlavha: 'Muammoli hisobotlar',
+      matn: `${m.flagSoni} ta hisobot muammoli holatda.`,
+      daraja: 'yuqori'
+    });
+  }
+
+  return {
+    sarlavha: facts.kategoriya?.nomi ? `${facts.kategoriya.nomi} bo'yicha tahlil` : 'Kunlik nazorat tahlili',
+    xulosa: exactAnswer,
+    holat,
+    insights,
+    tavsiyalar: [
+      Number(m.topshirmagan || 0) > 0 ? 'Hisobot topshirmagan tashkilotlarga tezkor eslatma yuborish.' : 'Joriy hisobot intizomini saqlab qolish.',
+      Number(m.flagSoni || 0) > 0 ? 'Muammoli hisobotlarni alohida tekshirish.' : 'Hisobot sifatini muntazam nazorat qilish.',
+      'Kun yakunida bajarilish ko\'rsatkichini qayta tekshirish.'
+    ],
+    savolJavobi: exactAnswer,
+    speechText: exactAnswer
+  };
+}
+
+function openAITextOl(payload) {
+  if (payload && typeof payload.output_text === 'string' && payload.output_text.trim()) {
+    return payload.output_text.trim();
+  }
+
+  const parts = [];
+  for (const item of (payload?.output || [])) {
+    if (item.type !== 'message') continue;
+    for (const c of (item.content || [])) {
+      if (c.type === 'output_text' && c.text) parts.push(c.text);
+    }
+  }
+  return parts.join('\n').trim();
+}
+
+async function openAITahlil(facts, savol, exactAnswer) {
+  // API kaliti bo'lmasa ham deterministik lokal analitika ishlaydi.
+  if (!process.env.OPENAI_API_KEY) return lokalTahlil(facts, exactAnswer);
+
+  const schema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      sarlavha: { type: 'string' },
+      xulosa: { type: 'string' },
+      holat: { type: 'string', enum: ['yaxshi', 'diqqat', 'xavf'] },
+      insights: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            sarlavha: { type: 'string' },
+            matn: { type: 'string' },
+            daraja: { type: 'string', enum: ['past', 'orta', 'yuqori'] }
+          },
+          required: ['sarlavha', 'matn', 'daraja']
+        }
+      },
+      tavsiyalar: { type: 'array', items: { type: 'string' } },
+      savolJavobi: { type: 'string' },
+      speechText: { type: 'string' }
+    },
+    required: ['sarlavha', 'xulosa', 'holat', 'insights', 'tavsiyalar', 'savolJavobi', 'speechText']
+  };
+
+  const safeFacts = {
+    sana: facts.sana,
+    kategoriya: facts.kategoriya,
+    tashkilot: facts.tashkilot,
+    metrics: facts.metrics,
+    tashkilotlar: facts.tashkilotlar,
+    trend: facts.trend
+  };
+
+  const response = await fetch('https://api.openai.com/v1/responses', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      model: process.env.OPENAI_MODEL || 'gpt-5.6',
+      store: false,
+      instructions: [
+        "Siz SysOne Xisobot Nazorat platformasining professional AI analitigisiz.",
+        "Faqat server bergan JSON faktlardan foydalaning; raqamlarni o'ylab topmang va o'zgartirmang.",
+        "Kategoriya so'ralgan bo'lsa faqat o'sha kategoriya bo'yicha gapiring.",
+        "Hisobot topshirmaganlar haqida javobda xodim ism-familiyalarini aytmang; tashkilotlar kesimini ishlating.",
+        "Hisobot topshirgan noyob xodimlar soni va jami hisobotlar soni boshqa-boshqa ko'rsatkich ekanini aniq ajrating.",
+        "O'zbek lotin adabiy tilida ravon, sodda, rasmiy va qisqa yozing.",
+        "speechText ovozda ravon o'qishga mos, keraksiz belgilar va markdownsiz bo'lsin."
+      ].join(' '),
+      input: `FOYDALANUVCHI SAVOLI:\n${savol || 'Bugungi kunlik hisobotni tahlil qil.'}\n\nSERVER HISOBLAGAN ANIQ JAVOB:\n${exactAnswer}\n\nFAKTLAR:\n${JSON.stringify(safeFacts)}`,
+      max_output_tokens: 1200,
+      text: {
+        format: {
+          type: 'json_schema',
+          name: 'sysone_dashboard_analysis',
+          strict: true,
+          schema
+        }
+      }
+    })
+  });
+
+  const payload = await response.json();
+  if (!response.ok) {
+    console.error('OpenAI API xatosi:', payload);
+    return lokalTahlil(facts, exactAnswer);
+  }
+
+  const text = openAITextOl(payload);
+  if (!text) return lokalTahlil(facts, exactAnswer);
+
+  try {
+    const parsed = JSON.parse(text);
+    // Faktik savol javobi va ovoz matni AI tomonidan o'zgartirilmasin.
+    parsed.savolJavobi = exactAnswer;
+    parsed.speechText = exactAnswer;
+    if (!parsed.xulosa) parsed.xulosa = exactAnswer;
+    return parsed;
+  } catch (err) {
+    console.error('AI JSON parse xatosi:', err.message, text);
+    return lokalTahlil(facts, exactAnswer);
+  }
+}
+
+app.post('/api/aiTahlil', async (req, res) => {
+  const user = await checkAuth(req);
+  if (!user) return res.status(401).json({ ok: false, xato: "Ruxsat yo'q" });
+
+  if (!aiRateRuxsat(user.id || user.fio)) {
+    return res.status(429).json({ ok: false, xato: "AI so'rovlari juda ko'p. Bir daqiqadan so'ng qayta urinib ko'ring." });
+  }
+
+  try {
+    const savol = String(req.body.savol || '').trim().slice(0, 1200);
+    const facts = await aiFaktlarYarat(user, savol, req.body || {});
+    const exactAnswer = aiAniqJavob(facts);
+
+    const cacheKey = JSON.stringify({
+      user: user.id || user.fio,
+      savol: normalizeUzbek(savol),
+      sana: facts.sana,
+      kategoriya: facts.kategoriya?.id || '',
+      tashkilot: facts.tashkilot?.id || ''
+    });
+
+    const cached = aiCache.get(cacheKey);
+    if (cached && Date.now() - cached.vaqt < 2 * 60_000) {
+      return res.json({
+        ok: true,
+        tahlil: cached.tahlil,
+        model: cached.model,
+        cached: true,
+        facts: { sana: facts.sana, kategoriya: facts.kategoriya, tashkilot: facts.tashkilot }
+      });
+    }
+
+    const tahlil = await openAITahlil(facts, savol, exactAnswer);
+    const model = process.env.OPENAI_API_KEY ? (process.env.OPENAI_MODEL || 'gpt-5.6') : 'SysOne Local Analytics';
+
+    aiCache.set(cacheKey, { vaqt: Date.now(), tahlil, model });
+    await auditLog(user.fio, 'AI_TAHLIL', `${facts.sana} | ${facts.kategoriya?.nomi || 'barcha kategoriya'}`);
+
+    res.json({
+      ok: true,
+      tahlil,
+      model,
+      cached: false,
+      facts: { sana: facts.sana, kategoriya: facts.kategoriya, tashkilot: facts.tashkilot }
+    });
+  } catch (err) {
+    console.error('aiTahlil xatosi:', err);
+    res.status(500).json({ ok: false, xato: err.message });
   }
 });
 
