@@ -121,7 +121,9 @@ const AI_CONFIG_KEY = 'AI_ASSISTANT_CONFIG';
 const AI_DEFAULT_CONFIG = Object.freeze({
   ism: 'Hisobchi',
   uygotishSozi: 'Hisobchi',
+  uygotishFaol: true,
   ovoz: 'Kore',
+  nutqTezligi: 1.08,
   avtomatikOvoz: true,
   savollar: [
     "Bugungi holat qanday?",
@@ -147,19 +149,33 @@ function aiConfigTozalash(raw = {}) {
   const uygotishSozi = String(raw.uygotishSozi || ism).trim().slice(0, 40) || ism;
   const ovoz = AI_TTS_VOICES.has(String(raw.ovoz || '').trim()) ? String(raw.ovoz).trim() : AI_DEFAULT_CONFIG.ovoz;
   const avtomatikOvoz = raw.avtomatikOvoz === false || raw.avtomatikOvoz === 'false' ? false : true;
-  return { ism, uygotishSozi, ovoz, avtomatikOvoz, savollar };
+  const uygotishFaol = raw.uygotishFaol === false || raw.uygotishFaol === 'false' ? false : true;
+  const nutqTezligiRaw = Number(raw.nutqTezligi ?? AI_DEFAULT_CONFIG.nutqTezligi);
+  const nutqTezligi = Math.max(0.85, Math.min(1.30, Number.isFinite(nutqTezligiRaw) ? nutqTezligiRaw : 1.08));
+  return { ism, uygotishSozi, uygotishFaol, ovoz, nutqTezligi, avtomatikOvoz, savollar };
 }
 
-async function aiConfigOl() {
+let aiConfigCache = { qiymat: null, vaqt: 0 };
+function aiConfigCacheTozala() { aiConfigCache = { qiymat: null, vaqt: 0 }; }
+async function aiConfigOl(force = false) {
+  const now = Date.now();
+  if (!force && aiConfigCache.qiymat && now - aiConfigCache.vaqt < 60_000) return aiConfigCache.qiymat;
   try {
     const { data, error } = await supabase.from('sozlamalar').select('qiymat').eq('kalit', AI_CONFIG_KEY).maybeSingle();
     if (error) throw error;
-    if (!data?.qiymat) return aiConfigTozalash(AI_DEFAULT_CONFIG);
-    const raw = typeof data.qiymat === 'string' ? JSON.parse(data.qiymat) : data.qiymat;
-    return aiConfigTozalash(raw);
+    let qiymat;
+    if (!data?.qiymat) qiymat = aiConfigTozalash(AI_DEFAULT_CONFIG);
+    else {
+      const raw = typeof data.qiymat === 'string' ? JSON.parse(data.qiymat) : data.qiymat;
+      qiymat = aiConfigTozalash(raw);
+    }
+    aiConfigCache = { qiymat, vaqt: now };
+    return qiymat;
   } catch (err) {
     console.error('AI sozlama o\'qish xatosi:', err.message);
-    return aiConfigTozalash(AI_DEFAULT_CONFIG);
+    const qiymat = aiConfigTozalash(AI_DEFAULT_CONFIG);
+    aiConfigCache = { qiymat, vaqt: now };
+    return qiymat;
   }
 }
 
@@ -562,6 +578,7 @@ app.post('/api/xodimQosh', async (req, res) => {
   }]);
   if (error) return res.json({ ok: false, xato: error.message });
   await auditLog(u.fio, 'XODIM_QOSHILDI', `${id} - ${fio}`);
+  dashboardFastCacheTozala();
   res.json({ ok: true, id });
 });
 
@@ -581,6 +598,7 @@ app.post('/api/xodimTahrir', async (req, res) => {
   const { error } = await supabase.from('xodimlar').update(updateData).eq('id', xodimId);
   if (error) return res.json({ ok: false, xato: error.message });
   await auditLog(u.fio, 'XODIM_TAHRIR', xodimId);
+  dashboardFastCacheTozala();
   res.json({ ok: true });
 });
 
@@ -597,6 +615,8 @@ app.post('/api/mfyQosh', async (req, res) => {
   const { error } = await supabase.from('mfy').insert([{ id, nomi: req.body.nomi, rahbar: req.body.rahbar || '', tel: req.body.tel || '' }]);
   if (error) return res.json({ ok: false, xato: error.message });
   await auditLog(u.fio, 'MFY_QOSHILDI', req.body.nomi);
+  dashboardFastCacheTozala();
+  aiDirectoryCache.vaqt = 0;
   res.json({ ok: true, id });
 });
 
@@ -605,6 +625,8 @@ app.post('/api/mfyTahrir', async (req, res) => {
   const { error } = await supabase.from('mfy').update({ nomi: req.body.nomi, rahbar: req.body.rahbar, tel: req.body.tel }).eq('id', req.body.mfyId);
   if (error) return res.json({ ok: false, xato: error.message });
   await auditLog(u.fio, 'MFY_TAHRIR', req.body.mfyId);
+  dashboardFastCacheTozala();
+  aiDirectoryCache.vaqt = 0;
   res.json({ ok: true });
 });
 
@@ -613,6 +635,8 @@ app.post('/api/mfyOchir', async (req, res) => {
   const { error } = await supabase.from('mfy').delete().eq('id', req.body.mfyId);
   if (error) return res.json({ ok: false, xato: error.message });
   await auditLog(u.fio, 'MFY_OCHIRILDI', req.body.mfyId);
+  dashboardFastCacheTozala();
+  aiDirectoryCache.vaqt = 0;
   res.json({ ok: true });
 });
 
@@ -622,6 +646,8 @@ app.post('/api/kategoriyaQosh', async (req, res) => {
   const { error } = await supabase.from('kategoriyalar').insert([{ id, nomi: req.body.nomi, tavsif: req.body.tavsif || '' }]);
   if (error) return res.json({ ok: false, xato: error.message });
   await auditLog(u.fio, 'KATEGORIYA_QOSHILDI', req.body.nomi);
+  dashboardFastCacheTozala();
+  aiDirectoryCache.vaqt = 0;
   res.json({ ok: true, id });
 });
 
@@ -630,6 +656,8 @@ app.post('/api/kategoriyaTahrir', async (req, res) => {
   const { error } = await supabase.from('kategoriyalar').update({ nomi: req.body.nomi, tavsif: req.body.tavsif }).eq('id', req.body.kategoriyaId);
   if (error) return res.json({ ok: false, xato: error.message });
   await auditLog(u.fio, 'KATEGORIYA_TAHRIR', req.body.kategoriyaId);
+  dashboardFastCacheTozala();
+  aiDirectoryCache.vaqt = 0;
   res.json({ ok: true });
 });
 
@@ -638,6 +666,8 @@ app.post('/api/kategoriyaOchir', async (req, res) => {
   const { error } = await supabase.from('kategoriyalar').delete().eq('id', req.body.kategoriyaId);
   if (error) return res.json({ ok: false, xato: error.message });
   await auditLog(u.fio, 'KATEGORIYA_OCHIRILDI', req.body.kategoriyaId);
+  dashboardFastCacheTozala();
+  aiDirectoryCache.vaqt = 0;
   res.json({ ok: true });
 });
 
@@ -920,6 +950,7 @@ app.post('/api/hisobotBoshla', async (req, res) => {
       await supabase.from('vazifalar').update({ holat: 'bajarildi' }).eq('id', vazifaId);
     }
 
+    dashboardFastCacheTozala();
     res.json({ ok: true, id });
   } catch (err) {
     res.json({ ok: false, xato: err.message });
@@ -942,6 +973,7 @@ app.post('/api/hisobotDavom', async (req, res) => {
     }).eq('id', hisobotId);
 
     if (error) return res.json({ ok: false, xato: error.message });
+    dashboardFastCacheTozala();
     res.json({ ok: true });
   } catch (err) {
     res.json({ ok: false, xato: err.message });
@@ -970,6 +1002,7 @@ app.post('/api/hisobotYakun', async (req, res) => {
       await supabase.from('vazifalar').update({ holat: 'bajarildi' }).eq('id', vazifaId);
     }
 
+    dashboardFastCacheTozala();
     res.json({ ok: true });
   } catch (err) {
     res.json({ ok: false, xato: err.message });
@@ -1072,6 +1105,35 @@ app.post('/api/tahrirRad', async (req, res) => {
 const aiRateLimitMap = new Map();
 const aiCache = new Map();
 
+// FAST 2.0: dashboard va katalog ma'lumotlari qisqa muddat RAMda saqlanadi.
+// Bu bir savol uchun Supabase'ga takroriy murojaatlarni keskin kamaytiradi.
+const dashboardFastCache = new Map();
+const AI_SNAPSHOT_CACHE_MS = Math.max(2000, Number(process.env.AI_SNAPSHOT_CACHE_MS || 10000));
+let aiDirectoryCache = { vaqt: 0, kategoriyalar: [], tashkilotlar: [] };
+
+function dashboardFastCacheKey(user, targetSana, kunlar, mfyId, kategoriyaId) {
+  return [user?.id || user?.fio || 'u', user?.rol || '', targetSana, kunlar, mfyId || '', kategoriyaId || ''].join('|');
+}
+function dashboardFastCacheTozala() {
+  dashboardFastCache.clear();
+}
+async function aiDirectoryOl(force = false) {
+  const now = Date.now();
+  if (!force && aiDirectoryCache.vaqt && now - aiDirectoryCache.vaqt < 60_000) return aiDirectoryCache;
+  const [katRes, mfyRes] = await Promise.all([
+    supabase.from('kategoriyalar').select('id,nomi'),
+    supabase.from('mfy').select('id,nomi')
+  ]);
+  if (katRes.error) throw katRes.error;
+  if (mfyRes.error) throw mfyRes.error;
+  aiDirectoryCache = {
+    vaqt: now,
+    kategoriyalar: katRes.data || [],
+    tashkilotlar: mfyRes.data || []
+  };
+  return aiDirectoryCache;
+}
+
 function aiRateRuxsat(userId) {
   const key = String(userId || 'unknown');
   const now = Date.now();
@@ -1093,6 +1155,10 @@ async function dashboardSnapshotYarat(user, options = {}) {
   // Nazoratchi server darajasida faqat o'z tashkilotini ko'radi.
   if (user.rol === 'nazoratchi') mfyId = String(user.mfyId || '');
 
+  const fastKey = dashboardFastCacheKey(user, targetSana, kunlar, mfyId, kategoriyaId);
+  const fastHit = dashboardFastCache.get(fastKey);
+  if (fastHit && Date.now() - fastHit.vaqt < AI_SNAPSHOT_CACHE_MS) return fastHit.snapshot;
+
   let xQuery = supabase
     .from('xodimlar')
     .select('id,fio,mfy_id,kategoriya_id,holat,ish_holati');
@@ -1110,20 +1176,17 @@ async function dashboardSnapshotYarat(user, options = {}) {
   if (mfyId) hQuery = hQuery.eq('mfy_id', mfyId);
   if (kategoriyaId) hQuery = hQuery.eq('kategoriya_id', kategoriyaId);
 
-  const [xRes, hRes, mRes, kRes] = await Promise.all([
+  const [xRes, hRes, directory] = await Promise.all([
     xQuery,
     hQuery,
-    supabase.from('mfy').select('id,nomi'),
-    supabase.from('kategoriyalar').select('id,nomi')
+    aiDirectoryOl()
   ]);
 
   if (xRes.error) throw xRes.error;
   if (hRes.error) throw hRes.error;
-  if (mRes.error) throw mRes.error;
-  if (kRes.error) throw kRes.error;
 
-  const mfyMap = Object.fromEntries((mRes.data || []).map(x => [String(x.id), x.nomi]));
-  const katMap = Object.fromEntries((kRes.data || []).map(x => [String(x.id), x.nomi]));
+  const mfyMap = Object.fromEntries((directory.tashkilotlar || []).map(x => [String(x.id), x.nomi]));
+  const katMap = Object.fromEntries((directory.kategoriyalar || []).map(x => [String(x.id), x.nomi]));
 
   const xodimlar = (xRes.data || []).map(x => ({
     id: x.id,
@@ -1238,7 +1301,7 @@ async function dashboardSnapshotYarat(user, options = {}) {
     })
     .sort((a, b) => b.foiz - a.foiz || a.nomi.localeCompare(b.nomi, 'uz'));
 
-  return {
+  const snapshot = {
     sana: targetSana,
     davr: { dan: boshlanish, gacha: targetSana, kunlar },
     scope: {
@@ -1279,6 +1342,12 @@ async function dashboardSnapshotYarat(user, options = {}) {
     trend,
     tashkilotlar
   };
+  dashboardFastCache.set(fastKey, { vaqt: Date.now(), snapshot });
+  if (dashboardFastCache.size > 80) {
+    const birinchi = dashboardFastCache.keys().next().value;
+    dashboardFastCache.delete(birinchi);
+  }
+  return snapshot;
 }
 
 // Dashboard frontendining yangi endpointi.
@@ -1301,16 +1370,9 @@ app.get('/api/dashboardSnapshot', async (req, res) => {
 });
 
 async function aiFaktlarYarat(user, savol, body = {}) {
-  const [katRes, mfyRes] = await Promise.all([
-    supabase.from('kategoriyalar').select('id,nomi'),
-    supabase.from('mfy').select('id,nomi')
-  ]);
-
-  if (katRes.error) throw katRes.error;
-  if (mfyRes.error) throw mfyRes.error;
-
-  const kategoriyalar = katRes.data || [];
-  const tashkilotlar = mfyRes.data || [];
+  const directory = await aiDirectoryOl();
+  const kategoriyalar = directory.kategoriyalar || [];
+  const tashkilotlar = directory.tashkilotlar || [];
 
   let kategoriya = null;
   if (body.kategoriyaId) {
@@ -1343,10 +1405,18 @@ async function aiFaktlarYarat(user, savol, body = {}) {
   const wantsSubmitted = submittedWords.some(w => q.includes(w));
 
   let intent = 'daily_summary';
-  if (wantsMissing && kategoriya) intent = 'category_missing';
+  if ((q.includes('eng past') || q.includes('eng yomon') || q.includes('past korsatkich')) && q.includes('tashkilot')) intent = 'lowest_org';
+  else if ((q.includes('eng yaxshi') || q.includes('eng yuqori') || q.includes('yuqori korsatkich')) && q.includes('tashkilot')) intent = 'highest_org';
+  else if (q.includes('birinchi navbat') || (q.includes('etibor') && q.includes('tashkilot'))) intent = 'priority_org';
+  else if ((q.includes('3 ta') || q.includes('uchta') || q.includes('uch ta')) && (q.includes('amaliy') || q.includes('ish'))) intent = 'action_plan';
+  else if (q.includes('bajarilish') && (q.includes('foiz') || q.includes('daraja') || q.includes('qancha') || q.includes('necha'))) intent = 'completion_rate';
+  else if (q.includes('uzrli') || q.includes('sababli')) intent = 'excused_summary';
+  else if ((q.includes('jami') || q.includes('faol')) && q.includes('xodim') && (q.includes('nech') || q.includes('qancha') || q.includes('son'))) intent = 'total_employees';
+  else if (wantsMissing && kategoriya) intent = 'category_missing';
   else if (kategoriya) intent = 'category_summary';
   else if (wantsMissing) intent = 'missing_summary';
   else if (wantsSubmitted) intent = 'submitted_summary';
+  else if (q.includes('hisobot') && (q.includes('nechta') || q.includes('qancha') || q.includes('jami') || q.includes('soni'))) intent = 'report_count';
 
   // AI ga xodim FIO, PINFL, telefon, GPS yoki rasm berilmaydi.
   const safeTashkilotlar = (snapshot.tashkilotlar || []).map(x => ({
@@ -1390,6 +1460,37 @@ function aiAniqJavob(facts) {
     .sort((a, b) => Number(b.topshirmagan || 0) - Number(a.topshirmagan || 0));
 
   const topMissing = muammoliOrg.slice(0, 10);
+  const reyting = (facts.tashkilotlar || []).slice().sort((a,b) => Number(b.foiz||0)-Number(a.foiz||0));
+  const engYaxshi = reyting[0] || null;
+  const engPast = reyting.length ? reyting[reyting.length - 1] : null;
+
+  if (facts.intent === 'completion_rate') {
+    return `${sanaSoz}${scopeOrg} bajarilish darajasi ${m.bajarilishFoizi || 0} foiz.`;
+  }
+  if (facts.intent === 'excused_summary') {
+    return `${sanaSoz}${scopeOrg} ${m.uzrli || 0} nafar xodim sababli yoki uzrli holatda.`;
+  }
+  if (facts.intent === 'total_employees') {
+    return `${sanaSoz}${scopeOrg} jami ${m.jamiXodim || 0} nafar faol xodim mavjud.`;
+  }
+  if (facts.intent === 'report_count') {
+    return `${sanaSoz}${scopeOrg} jami ${m.hisobotSoni || 0} ta hisobot qabul qilindi. Hisobot topshirgan noyob xodimlar soni ${m.topshirgan || 0} nafar.`;
+  }
+  if (facts.intent === 'lowest_org') {
+    return engPast ? `${sanaSoz} eng past bajarilish ko'rsatkichi ${engPast.nomi} tashkilotida: ${engPast.foiz || 0} foiz. ${engPast.topshirmagan || 0} nafar xodim hisobot topshirmagan.` : `${sanaSoz} tashkilotlar reytingi uchun ma'lumot yetarli emas.`;
+  }
+  if (facts.intent === 'highest_org') {
+    return engYaxshi ? `${sanaSoz} eng yuqori bajarilish ko'rsatkichi ${engYaxshi.nomi} tashkilotida: ${engYaxshi.foiz || 0} foiz.` : `${sanaSoz} tashkilotlar reytingi uchun ma'lumot yetarli emas.`;
+  }
+  if (facts.intent === 'priority_org') {
+    const p = topMissing[0] || engPast;
+    return p ? `Birinchi navbatda ${p.nomi} tashkilotiga e'tibor berish tavsiya etiladi. U yerda ${p.topshirmagan || 0} nafar xodim hisobot topshirmagan, bajarilish darajasi ${p.foiz || 0} foiz.` : `Hozircha alohida tezkor e'tibor talab qiladigan tashkilot aniqlanmadi.`;
+  }
+  if (facts.intent === 'action_plan') {
+    const p = topMissing[0] || engPast;
+    const bir = p ? `${p.nomi} tashkilotidagi topshirmagan xodimlarga tezkor eslatma yuborish` : `joriy hisobot intizomini saqlash`;
+    return `Bugun uchta amaliy ish tavsiya etiladi: birinchisi, ${bir}; ikkinchisi, kun davomida bajarilish darajasini qayta tekshirish; uchinchisi, hisobot sifati va kechikkan hisobotlarni nazorat qilish.`;
+  }
 
   if (facts.intent === 'category_missing') {
     let text = `${sanaSoz}${scopeOrg} ${kategoriya} toifasi bo'yicha ${muammoliOrg.length} ta tashkilotda hisobot topshirmagan xodimlar mavjud. ` +
@@ -1433,6 +1534,31 @@ function aiAniqJavob(facts) {
     `Bajarilish darajasi ${m.bajarilishFoizi || 0} foiz. ${m.kechikkan || 0} ta kechikkan hisobot mavjud.`;
 }
 
+function aiFastSavolmi(savol, facts) {
+  const q = normalizeUzbek(savol);
+  const fastIntents = new Set([
+    'daily_summary','submitted_summary','missing_summary','category_summary','category_missing',
+    'completion_rate','excused_summary','total_employees','report_count','lowest_org','highest_org','priority_org','action_plan'
+  ]);
+  if (!fastIntents.has(facts?.intent)) return false;
+  // Chuqur tahlil, sabab yoki trend so'ralgan bo'lsa Gemini ishlaydi.
+  const murakkab = ['nima uchun','nega','sababini tahlil','chuqur tahlil','tendensiya','trend','solishtir','taqqosla','xulosa chiqar'];
+  if (murakkab.some(x => q.includes(normalizeUzbek(x)))) return false;
+  if (facts?.intent === 'daily_summary') {
+    const oddiy = ['bugungi holat','bugun holat','umumiy holat','kunlik holat','bugun qanday','hisobot holati','bugungi hisobot'];
+    return oddiy.some(x => q.includes(normalizeUzbek(x))) || q === '';
+  }
+  return true;
+}
+
+function aiSpeechJavob(facts, exactAnswer) {
+  const m = facts?.metrics || {};
+  if (facts?.intent === 'daily_summary') {
+    return speechTextTayyorla(`Bugun ${m.topshirgan || 0} nafar xodim hisobot topshirdi. ${m.topshirmagan || 0} nafar xodim hali topshirmagan. Bajarilish darajasi ${m.bajarilishFoizi || 0} foiz. ${m.uzrli || 0} nafar xodim sababli holatda.`);
+  }
+  return speechTextTayyorla(exactAnswer);
+}
+
 function lokalTahlil(facts, exactAnswer) {
   const m = facts.metrics || {};
   let holat = 'yaxshi';
@@ -1465,7 +1591,7 @@ function lokalTahlil(facts, exactAnswer) {
       'Kun yakunida bajarilish ko\'rsatkichini qayta tekshirish.'
     ],
     savolJavobi: exactAnswer,
-    speechText: speechTextTayyorla(exactAnswer)
+    speechText: aiSpeechJavob(facts, exactAnswer)
   };
 }
 
@@ -1576,8 +1702,8 @@ async function geminiTahlil(facts, savol, exactAnswer) {
         }]
       }],
       generationConfig: {
-        temperature: 0.2,
-        maxOutputTokens: 1200,
+        temperature: 0.1,
+        maxOutputTokens: 650,
         responseMimeType: 'application/json',
         responseJsonSchema: schema
       }
@@ -1589,7 +1715,7 @@ async function geminiTahlil(facts, savol, exactAnswer) {
     const parsed = JSON.parse(text);
     // Faktik savol javobi server hisoblagan qiymatdan olinadi — model uni o'zgartira olmaydi.
     parsed.savolJavobi = exactAnswer;
-    parsed.speechText = speechTextTayyorla(exactAnswer);
+    parsed.speechText = aiSpeechJavob(facts, exactAnswer);
     if (!parsed.xulosa) parsed.xulosa = exactAnswer;
     return parsed;
   } catch (err) {
@@ -1599,6 +1725,7 @@ async function geminiTahlil(facts, savol, exactAnswer) {
 }
 
 app.post('/api/aiTahlil', async (req, res) => {
+  const umumiyBoshlanish = Date.now();
   const user = await checkAuth(req);
   if (!user) return res.status(401).json({ ok: false, xato: "Ruxsat yo'q" });
 
@@ -1608,8 +1735,20 @@ app.post('/api/aiTahlil', async (req, res) => {
 
   try {
     const savol = String(req.body.savol || '').trim().slice(0, 1200);
-    const facts = await aiFaktlarYarat(user, savol, req.body || {});
+    const faktBoshlanish = Date.now();
+    const [facts, cfg] = await Promise.all([
+      aiFaktlarYarat(user, savol, req.body || {}),
+      aiConfigOl()
+    ]);
+    const faktMs = Date.now() - faktBoshlanish;
     const exactAnswer = aiAniqJavob(facts);
+    const speechText = aiSpeechJavob(facts, exactAnswer);
+
+    // FAST 2.0: tahlil davom etayotgan paytning o'zida ovozni tayyorlashni boshlaymiz.
+    // Frontend /aiSpeech ni chaqirganda shu tayyorlanayotgan audio kutib olinadi.
+    if (req.body.tezkor === true && process.env.GEMINI_API_KEY && cfg.avtomatikOvoz !== false) {
+      aiOvozOldindanTayyorla(speechText, cfg.ovoz, cfg.ism).catch(() => {});
+    }
 
     const cacheKey = JSON.stringify({
       user: user.id || user.fio,
@@ -1626,21 +1765,38 @@ app.post('/api/aiTahlil', async (req, res) => {
         tahlil: cached.tahlil,
         model: cached.model,
         cached: true,
+        fastPath: cached.fastPath === true,
+        tezlik: { faktMs, tahlilMs: 0, jamiMs: Date.now() - umumiyBoshlanish },
         facts: { sana: facts.sana, kategoriya: facts.kategoriya, tashkilot: facts.tashkilot }
       });
     }
 
-    const tahlil = await geminiTahlil(facts, savol, exactAnswer);
-    const model = process.env.GEMINI_API_KEY ? (process.env.GEMINI_MODEL || 'gemini-3.6-flash') : 'SysOne Local Analytics';
+    const tahlilBoshlanish = Date.now();
+    const fastPath = aiFastSavolmi(savol, facts);
+    let tahlil;
+    let model;
+    if (fastPath) {
+      tahlil = lokalTahlil(facts, exactAnswer);
+      tahlil.speechText = speechText;
+      model = 'SysOne Fast 2.0';
+    } else {
+      tahlil = await geminiTahlil(facts, savol, exactAnswer);
+      tahlil.speechText = speechText;
+      model = process.env.GEMINI_API_KEY ? (process.env.GEMINI_MODEL || 'gemini-3.6-flash') : 'SysOne Local Analytics';
+    }
+    const tahlilMs = Date.now() - tahlilBoshlanish;
 
-    aiCache.set(cacheKey, { vaqt: Date.now(), tahlil, model });
-    await auditLog(user.fio, 'AI_TAHLIL', `${facts.sana} | ${facts.kategoriya?.nomi || 'barcha kategoriya'}`);
+    aiCache.set(cacheKey, { vaqt: Date.now(), tahlil, model, fastPath });
+    if (aiCache.size > 120) aiCache.delete(aiCache.keys().next().value);
+    auditLog(user.fio, 'AI_TAHLIL', `${facts.sana} | ${facts.kategoriya?.nomi || 'barcha kategoriya'} | ${fastPath ? 'FAST' : 'GEMINI'}`).catch(() => {});
 
     res.json({
       ok: true,
       tahlil,
       model,
       cached: false,
+      fastPath,
+      tezlik: { faktMs, tahlilMs, jamiMs: Date.now() - umumiyBoshlanish },
       facts: { sana: facts.sana, kategoriya: facts.kategoriya, tashkilot: facts.tashkilot }
     });
   } catch (err) {
@@ -1657,7 +1813,8 @@ app.get('/api/aiSozlama', async (req, res) => {
   const user = await checkAuth(req);
   if (!user) return res.status(401).json({ ok: false, xato: "Ruxsat yo'q" });
   const sozlama = await aiConfigOl();
-  res.json({ ok: true, sozlama, ttsBor: !!process.env.GEMINI_API_KEY, sttBor: !!process.env.GEMINI_API_KEY, provider: 'Google Gemini', model: process.env.GEMINI_MODEL || 'gemini-3.6-flash', liveModel: process.env.GEMINI_LIVE_MODEL || 'gemini-3.1-flash-live-preview' });
+  res.json({ ok: true, sozlama, ttsBor: !!process.env.GEMINI_API_KEY, sttBor: !!process.env.GEMINI_API_KEY, provider: 'Google Gemini', fast2: true, model: process.env.GEMINI_MODEL || 'gemini-3.6-flash', liveModel: process.env.GEMINI_LIVE_MODEL || 'gemini-3.1-flash-live-preview' });
+  if (process.env.GEMINI_API_KEY) geminiLiveSessiyaOldindanOch(sozlama.ovoz, sozlama.ism).catch(() => {});
 });
 
 app.post('/api/aiSozlamaSaqla', async (req, res) => {
@@ -1670,7 +1827,9 @@ app.post('/api/aiSozlamaSaqla', async (req, res) => {
     const sozlama = aiConfigTozalash(req.body || {});
     const { error } = await supabase.from('sozlamalar').upsert([{ kalit: AI_CONFIG_KEY, qiymat: JSON.stringify(sozlama) }], { onConflict: 'kalit' });
     if (error) throw error;
-    await auditLog(user.fio, 'AI_SOZLAMA_SAQLANDI', `Ism: ${sozlama.ism}; ovoz: ${sozlama.ovoz}`);
+    aiConfigCache = { qiymat: sozlama, vaqt: Date.now() };
+    geminiLiveSessiyaOldindanOch(sozlama.ovoz, sozlama.ism).catch(() => {});
+    await auditLog(user.fio, 'AI_SOZLAMA_SAQLANDI', `Ism: ${sozlama.ism}; ovoz: ${sozlama.ovoz}; uyg'otish: ${sozlama.uygotishFaol ? 'yoqilgan' : 'o\'chirilgan'}`);
     res.json({ ok: true, sozlama });
   } catch (err) {
     console.error('aiSozlamaSaqla xatosi:', err);
@@ -1703,7 +1862,7 @@ app.post('/api/aiTranscribe', aiAudioUpload.single('audio'), async (req, res) =>
           { inlineData: { mimeType: mime, data } }
         ]
       }],
-      generationConfig: { temperature: 0, maxOutputTokens: 400 }
+      generationConfig: { temperature: 0, maxOutputTokens: 180 }
     });
 
     let matn = geminiMatnOl(payload)
@@ -1747,7 +1906,7 @@ function websocketCtorOl() {
   try { return { Ctor: require('ws'), turi: 'ws' }; } catch (_) { return null; }
 }
 
-async function geminiLiveOvozYarat(matn, voice, assistantName) {
+async function geminiLiveOvozYaratBirMartalik(matn, voice, assistantName) {
   const wsInfo = websocketCtorOl();
   if (!wsInfo || !process.env.GEMINI_API_KEY) return null;
   if (String(process.env.GEMINI_LIVE_TTS || 'true').toLowerCase() === 'false') return null;
@@ -1769,7 +1928,7 @@ async function geminiLiveOvozYarat(matn, voice, assistantName) {
       if (err) reject(err); else resolve(value);
     };
 
-    const timer = setTimeout(() => yakunla(new Error('Gemini Live ovoz javobi vaqti tugadi')), 30000);
+    const timer = setTimeout(() => yakunla(new Error('Gemini Live ovoz javobi vaqti tugadi')), 10000);
 
     const xabarniQaytaIshla = async raw => {
       try {
@@ -1839,6 +1998,198 @@ async function geminiLiveOvozYarat(matn, voice, assistantName) {
   });
 }
 
+
+// ====================================================
+// FAST 2.0 — doimiy Gemini Live sessiyasi + TTS prefetch/kesh
+// ====================================================
+const geminiLivePool = new Map();
+const aiTtsCache = new Map();
+const aiTtsInflight = new Map();
+const AI_TTS_CACHE_MS = Math.max(30_000, Number(process.env.AI_TTS_CACHE_MS || 120_000));
+
+function aiTtsKalit(text, voice) {
+  return crypto.createHash('sha1').update(`${voice}|${String(text || '')}`).digest('hex');
+}
+function wsRawMatn(raw) {
+  if (typeof raw === 'string') return raw;
+  if (Buffer.isBuffer(raw)) return raw.toString('utf8');
+  if (raw instanceof ArrayBuffer) return Buffer.from(raw).toString('utf8');
+  if (raw?.data && Buffer.isBuffer(raw.data)) return raw.data.toString('utf8');
+  return String(raw || '');
+}
+function geminiLivePoolOchir(key, session) {
+  if (geminiLivePool.get(key) === session) geminiLivePool.delete(key);
+}
+function geminiLiveSessiyaYarat(voice, assistantName) {
+  const wsInfo = websocketCtorOl();
+  if (!wsInfo || !process.env.GEMINI_API_KEY) throw new Error('Gemini Live WebSocket mavjud emas');
+  const model = process.env.GEMINI_LIVE_MODEL || 'gemini-3.1-flash-live-preview';
+  const key = `${voice}|${assistantName || 'Hisobchi'}|${model}`;
+  const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(process.env.GEMINI_API_KEY)}`;
+  const ws = new wsInfo.Ctor(url);
+  let readyResolve, readyReject;
+  const session = {
+    key, ws, wsInfo, voice, assistantName, model,
+    ready: false, closed: false, current: null,
+    chain: Promise.resolve(), lastUsed: Date.now(),
+    readyPromise: new Promise((resolve, reject) => { readyResolve = resolve; readyReject = reject; })
+  };
+
+  const failCurrent = err => {
+    if (session.current) {
+      clearTimeout(session.current.timer);
+      const c = session.current; session.current = null;
+      c.reject(err);
+    }
+  };
+  const closeSession = err => {
+    if (session.closed) return;
+    session.closed = true;
+    session.ready = false;
+    geminiLivePoolOchir(key, session);
+    if (!session.ready) try { readyReject(err || new Error('Gemini Live sessiyasi yopildi')); } catch (_) {}
+    failCurrent(err || new Error('Gemini Live sessiyasi yopildi'));
+  };
+  const sendSetup = () => {
+    ws.send(JSON.stringify({
+      setup: {
+        model: `models/${model}`,
+        generationConfig: {
+          responseModalities: ['AUDIO'],
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } }
+        },
+        systemInstruction: {
+          parts: [{ text: `Siz ${assistantName || 'Hisobchi'} nomli o'zbekcha sun'iy intellekt yordamchisining ovozisiz. Faqat adabiy o'zbek tilida, ravon, tabiiy va professional gapiring. Berilgan matnga yangi fakt qo'shmang.` }]
+        }
+      }
+    }));
+  };
+  const onMessage = raw => {
+    try {
+      const msg = JSON.parse(wsRawMatn(raw?.data !== undefined ? raw.data : raw));
+      if (msg.setupComplete && !session.ready) {
+        session.ready = true;
+        readyResolve(session);
+        return;
+      }
+      const sc = msg.serverContent;
+      const c = session.current;
+      if (!c || !sc) return;
+      for (const part of (sc?.modelTurn?.parts || [])) {
+        if (part?.inlineData?.data) c.chunks.push(Buffer.from(part.inlineData.data, 'base64'));
+      }
+      if (sc.turnComplete) {
+        clearTimeout(c.timer);
+        session.current = null;
+        if (!c.chunks.length) c.reject(new Error('Gemini Live audio qaytarmadi'));
+        else c.resolve(pcm16ToWav(Buffer.concat(c.chunks), 24000, 1));
+      }
+    } catch (err) {
+      failCurrent(err);
+    }
+  };
+
+  if (wsInfo.turi === 'ws') {
+    ws.on('open', sendSetup);
+    ws.on('message', onMessage);
+    ws.on('error', err => closeSession(err));
+    ws.on('close', () => closeSession(new Error('Gemini Live ulanishi yopildi')));
+  } else {
+    ws.addEventListener('open', sendSetup);
+    ws.addEventListener('message', onMessage);
+    ws.addEventListener('error', () => closeSession(new Error('Gemini Live WebSocket xatosi')));
+    ws.addEventListener('close', () => closeSession(new Error('Gemini Live ulanishi yopildi')));
+  }
+
+  session.speak = text => {
+    const run = async () => {
+      await session.readyPromise;
+      if (session.closed) throw new Error('Gemini Live sessiyasi yopilgan');
+      session.lastUsed = Date.now();
+      return await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          if (session.current) session.current = null;
+          reject(new Error('Gemini Live ovoz javobi vaqti tugadi'));
+        }, 8_000);
+        session.current = { resolve, reject, timer, chunks: [] };
+        try {
+          session.ws.send(JSON.stringify({
+            realtimeInput: {
+              text: `Quyidagi matnni aynan va ravon o'qing. Hech qanday yangi gap qo'shmang. MATN: ${text}`
+            }
+          }));
+        } catch (err) {
+          clearTimeout(timer); session.current = null; reject(err);
+        }
+      });
+    };
+    const p = session.chain.then(run, run);
+    session.chain = p.catch(() => {});
+    return p;
+  };
+
+  geminiLivePool.set(key, session);
+  return session;
+}
+
+async function geminiLiveSessiyaOl(voice, assistantName) {
+  if (String(process.env.GEMINI_LIVE_TTS || 'true').toLowerCase() === 'false') return null;
+  const model = process.env.GEMINI_LIVE_MODEL || 'gemini-3.1-flash-live-preview';
+  const key = `${voice}|${assistantName || 'Hisobchi'}|${model}`;
+  let s = geminiLivePool.get(key);
+  if (!s || s.closed) s = geminiLiveSessiyaYarat(voice, assistantName);
+  await s.readyPromise;
+  return s;
+}
+async function geminiLiveSessiyaOldindanOch(voice, assistantName) {
+  if (!process.env.GEMINI_API_KEY) return false;
+  try { await geminiLiveSessiyaOl(voice, assistantName); return true; }
+  catch (err) { console.warn('Gemini Live prewarm xatosi:', err.message); return false; }
+}
+async function geminiLiveOvozYarat(matn, voice, assistantName) {
+  if (!process.env.GEMINI_API_KEY) return null;
+  try {
+    const s = await geminiLiveSessiyaOl(voice, assistantName);
+    if (!s) return null;
+    return await s.speak(matn);
+  } catch (err) {
+    console.warn("Doimiy Gemini Live sessiyasi xatosi, bir martalik ulanishga o'tildi:", err.message);
+    return await geminiLiveOvozYaratBirMartalik(matn, voice, assistantName);
+  }
+}
+
+async function aiOvozOldindanTayyorla(speechText, voice, assistantName) {
+  const text = String(speechText || '').trim();
+  if (!text || !process.env.GEMINI_API_KEY) return null;
+  const key = aiTtsKalit(text, voice);
+  const hit = aiTtsCache.get(key);
+  if (hit && Date.now() - hit.vaqt < AI_TTS_CACHE_MS) return hit.wav;
+  if (aiTtsInflight.has(key)) return await aiTtsInflight.get(key);
+
+  const p = geminiLiveOvozYarat(text, voice, assistantName)
+    .then(wav => {
+      if (wav) {
+        aiTtsCache.set(key, { vaqt: Date.now(), wav });
+        if (aiTtsCache.size > 40) aiTtsCache.delete(aiTtsCache.keys().next().value);
+      }
+      return wav;
+    })
+    .finally(() => aiTtsInflight.delete(key));
+  aiTtsInflight.set(key, p);
+  return await p;
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [k,v] of aiTtsCache) if (now - v.vaqt > AI_TTS_CACHE_MS) aiTtsCache.delete(k);
+  for (const [k,sess] of geminiLivePool) {
+    if (now - sess.lastUsed > 4 * 60_000) {
+      try { sess.ws.close(); } catch (_) {}
+      geminiLivePool.delete(k);
+    }
+  }
+}, 60_000).unref?.();
+
 app.post('/api/aiSpeech', async (req, res) => {
   const user = await checkAuth(req);
   if (!user) return res.status(401).json({ ok: false, xato: "Ruxsat yo'q" });
@@ -1852,9 +2203,12 @@ app.post('/api/aiSpeech', async (req, res) => {
     const requestedVoice = String(req.body.voice || '').trim();
     const voice = AI_TTS_VOICES.has(requestedVoice) ? requestedVoice : cfg.ovoz;
 
+    const boshlandi = Date.now();
+    const ttsKey = aiTtsKalit(speechText, voice);
+    const oldHit = aiTtsCache.get(ttsKey);
     let wav = null;
     try {
-      wav = await geminiLiveOvozYarat(speechText, voice, cfg.ism);
+      wav = await aiOvozOldindanTayyorla(speechText, voice, cfg.ism);
     } catch (liveErr) {
       console.warn('Gemini Live ovoz xatosi:', liveErr.message);
       return res.status(502).json({ ok: false, xato: `Gemini Live ovozini yaratib bo'lmadi: ${liveErr.message}` });
@@ -1863,8 +2217,10 @@ app.post('/api/aiSpeech', async (req, res) => {
 
     res.setHeader('Content-Type', 'audio/wav');
     res.setHeader('Cache-Control', 'no-store');
-    res.setHeader('X-AI-Voice', 'gemini-live');
+    res.setHeader('X-AI-Voice', 'gemini-live-fast2');
     res.setHeader('X-AI-Provider', 'Google-Gemini');
+    res.setHeader('X-AI-Cache', oldHit ? 'HIT' : 'MISS');
+    res.setHeader('X-AI-Time-Ms', String(Date.now() - boshlandi));
     res.send(wav);
   } catch (err) {
     console.error('Gemini ovoz xatosi:', err.message, err.payload || '');
