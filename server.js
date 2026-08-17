@@ -125,6 +125,7 @@ const AI_DEFAULT_CONFIG = Object.freeze({
   ovoz: 'Kore',
   nutqTezligi: 1.08,
   avtomatikOvoz: true,
+  ovozKutishSekund: 20,
   savollar: [
     "Bugungi holat qanday?",
     "Bugun nechta xodim hisobot topshirdi?",
@@ -152,7 +153,9 @@ function aiConfigTozalash(raw = {}) {
   const uygotishFaol = raw.uygotishFaol === false || raw.uygotishFaol === 'false' ? false : true;
   const nutqTezligiRaw = Number(raw.nutqTezligi ?? AI_DEFAULT_CONFIG.nutqTezligi);
   const nutqTezligi = Math.max(0.85, Math.min(1.30, Number.isFinite(nutqTezligiRaw) ? nutqTezligiRaw : 1.08));
-  return { ism, uygotishSozi, uygotishFaol, ovoz, nutqTezligi, avtomatikOvoz, savollar };
+  const timeoutRaw = Number(raw.ovozKutishSekund ?? AI_DEFAULT_CONFIG.ovozKutishSekund);
+  const ovozKutishSekund = Math.max(5, Math.min(120, Number.isFinite(timeoutRaw) ? Math.round(timeoutRaw) : 20));
+  return { ism, uygotishSozi, uygotishFaol, ovoz, nutqTezligi, avtomatikOvoz, ovozKutishSekund, savollar };
 }
 
 let aiConfigCache = { qiymat: null, vaqt: 0 };
@@ -550,6 +553,9 @@ app.get('/api/xodimlar', async (req, res) => {
 });
 
 app.get('/api/adminlar', async (req, res) => {
+  const user = await checkAuth(req);
+  if (!user) return res.status(401).json({ ok: false, xato: "Ruxsat yo'q" });
+  if (user.rol !== 'superadmin') return res.status(403).json({ ok: false, xato: "Adminlar ro'yxatini ko'rish uchun ruxsat yo'q" });
   const { data, error } = await supabase.from('adminlar').select('*');
   if (error) return res.json({ ok: false, xato: error.message });
   const adminlar = (data || []).map(a => ({
@@ -1553,9 +1559,23 @@ function aiFastSavolmi(savol, facts) {
 
 function aiSpeechJavob(facts, exactAnswer) {
   const m = facts?.metrics || {};
-  if (facts?.intent === 'daily_summary') {
-    return speechTextTayyorla(`Bugun ${m.topshirgan || 0} nafar xodim hisobot topshirdi. ${m.topshirmagan || 0} nafar xodim hali topshirmagan. Bajarilish darajasi ${m.bajarilishFoizi || 0} foiz. ${m.uzrli || 0} nafar xodim sababli holatda.`);
+  const intent = facts?.intent || '';
+  const kat = facts?.kategoriya?.nomi ? `${facts.kategoriya.nomi} bo'yicha ` : '';
+  // Ovoz uchun ekrandagi uzun tahlilni emas, qisqa va aniq xulosani o'qiymiz.
+  // Bu Gemini TTS vaqtini va audio hajmini kamaytiradi.
+  if (intent === 'daily_summary' || intent === 'submitted_summary') {
+    return speechTextTayyorla(`Bugun ${m.topshirgan || 0} nafar xodim hisobot topshirdi, ${m.topshirmagan || 0} nafari topshirmadi. Bajarilish ${m.bajarilishFoizi || 0} foiz, sababli holatda ${m.uzrli || 0} nafar.`);
   }
+  if (intent === 'category_summary' || intent === 'category_missing') {
+    return speechTextTayyorla(`Bugun ${kat}${m.topshirgan || 0} nafar topshirdi, ${m.topshirmagan || 0} nafar topshirmadi. Bajarilish ${m.bajarilishFoizi || 0} foiz.`);
+  }
+  if (intent === 'missing_summary') {
+    return speechTextTayyorla(`Bugun ${m.topshirmagan || 0} nafar xodim hisobot topshirmagan. Bajarilish ${m.bajarilishFoizi || 0} foiz.`);
+  }
+  if (intent === 'completion_rate') return speechTextTayyorla(`Bugungi bajarilish darajasi ${m.bajarilishFoizi || 0} foiz.`);
+  if (intent === 'report_count') return speechTextTayyorla(`Bugun jami ${m.hisobotSoni || 0} ta hisobot qabul qilindi. ${m.topshirgan || 0} nafar xodim topshirdi.`);
+  if (intent === 'total_employees') return speechTextTayyorla(`Jami ${m.jamiXodim || 0} nafar faol xodim mavjud.`);
+  if (intent === 'excused_summary') return speechTextTayyorla(`Bugun ${m.uzrli || 0} nafar xodim sababli yoki uzrli holatda.`);
   return speechTextTayyorla(exactAnswer);
 }
 
@@ -1814,7 +1834,6 @@ app.get('/api/aiSozlama', async (req, res) => {
   if (!user) return res.status(401).json({ ok: false, xato: "Ruxsat yo'q" });
   const sozlama = await aiConfigOl();
   res.json({ ok: true, sozlama, ttsBor: !!process.env.GEMINI_API_KEY, sttBor: !!process.env.GEMINI_API_KEY, provider: 'Google Gemini', fast2: true, model: process.env.GEMINI_MODEL || 'gemini-3.6-flash', liveModel: process.env.GEMINI_LIVE_MODEL || 'gemini-3.1-flash-live-preview' });
-  if (process.env.GEMINI_API_KEY) geminiLiveSessiyaOldindanOch(sozlama.ovoz, sozlama.ism).catch(() => {});
 });
 
 app.post('/api/aiSozlamaSaqla', async (req, res) => {
@@ -1828,7 +1847,6 @@ app.post('/api/aiSozlamaSaqla', async (req, res) => {
     const { error } = await supabase.from('sozlamalar').upsert([{ kalit: AI_CONFIG_KEY, qiymat: JSON.stringify(sozlama) }], { onConflict: 'kalit' });
     if (error) throw error;
     aiConfigCache = { qiymat: sozlama, vaqt: Date.now() };
-    geminiLiveSessiyaOldindanOch(sozlama.ovoz, sozlama.ism).catch(() => {});
     await auditLog(user.fio, 'AI_SOZLAMA_SAQLANDI', `Ism: ${sozlama.ism}; ovoz: ${sozlama.ovoz}; uyg'otish: ${sozlama.uygotishFaol ? 'yoqilgan' : 'o\'chirilgan'}`);
     res.json({ ok: true, sozlama });
   } catch (err) {
@@ -2005,7 +2023,7 @@ async function geminiLiveOvozYaratBirMartalik(matn, voice, assistantName) {
 const geminiLivePool = new Map();
 const aiTtsCache = new Map();
 const aiTtsInflight = new Map();
-const AI_TTS_CACHE_MS = Math.max(30_000, Number(process.env.AI_TTS_CACHE_MS || 120_000));
+const AI_TTS_CACHE_MS = Math.max(30_000, Number(process.env.AI_TTS_CACHE_MS || 600_000));
 
 function aiTtsKalit(text, voice) {
   return crypto.createHash('sha1').update(`${voice}|${String(text || '')}`).digest('hex');
