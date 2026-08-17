@@ -2158,6 +2158,101 @@ async function geminiLiveOvozYarat(matn, voice, assistantName) {
   }
 }
 
+function geminiAudioBlokOl(node, depth = 0) {
+  if (!node || depth > 14) return null;
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const hit = geminiAudioBlokOl(item, depth + 1);
+      if (hit) return hit;
+    }
+    return null;
+  }
+  if (typeof node !== 'object') return null;
+
+  const type = String(node.type || '').toLowerCase();
+  const mimeType = String(node.mime_type || node.mimeType || '').toLowerCase();
+  if ((type === 'audio' || mimeType.startsWith('audio/')) && typeof node.data === 'string' && node.data.length > 40) {
+    return {
+      data: node.data,
+      mimeType: mimeType || 'audio/wav',
+      sampleRate: Number(node.sample_rate || node.sampleRate || 24000),
+      channels: Number(node.channels || 1)
+    };
+  }
+
+  for (const value of Object.values(node)) {
+    const hit = geminiAudioBlokOl(value, depth + 1);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+// FAST 2.1: aniq matnni ovozga aylantirish uchun Live suhbat modelidan emas,
+// Google'ning maxsus Gemini TTS modelidan foydalanamiz. Bu aynan matn o'qish uchun
+// mo'ljallangan va brauzer speechSynthesis ovoziga tushib ketishni bartaraf etadi.
+async function geminiTTSOvozYarat(matn, voice, assistantName) {
+  if (!process.env.GEMINI_API_KEY) return null;
+  const model = process.env.GEMINI_TTS_MODEL || 'gemini-3.1-flash-tts-preview';
+  const input = [
+    `Siz ${assistantName || 'Hisobchi'} nomli o'zbekcha sun'iy intellekt yordamchisining ovozisiz.`,
+    "O'zbekiston adabiy o'zbek tilida ravon, tabiiy, aniq va professional gapiring.",
+    "Raqamlar, foizlar, sanalar va tashkilot nomlarini tushunarli talaffuz qiling.",
+    "Juda sekin gapirmang; tabiiy suhbat tezligida o'qing.",
+    "Quyidagi MATNni aynan o'qing, yangi fakt yoki izoh qo'shmang.",
+    `MATN: ${matn}`
+  ].join(' ');
+
+  const response = await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
+    method: 'POST',
+    headers: {
+      'x-goog-api-key': process.env.GEMINI_API_KEY,
+      'Content-Type': 'application/json',
+      'Api-Revision': '2026-05-20'
+    },
+    body: JSON.stringify({
+      model,
+      input,
+      response_format: { type: 'audio' },
+      generation_config: {
+        speech_config: [{ voice }]
+      }
+    })
+  });
+
+  let payload = null;
+  try { payload = await response.json(); }
+  catch (_) { payload = null; }
+
+  if (!response.ok) {
+    const detail = payload?.error?.message || payload?.message || `Gemini TTS HTTP ${response.status}`;
+    const err = new Error(detail);
+    err.status = response.status;
+    err.payload = payload;
+    throw err;
+  }
+
+  // Interactions TTS `output_audio.data` orqali 24 kHz, mono, 16-bit PCM qaytaradi.
+  // Google hujjatlaridagi JS/Python namunalari ham aynan shu xom PCM baytlarini WAV konteyneriga yozadi.
+  const outputAudioData = payload?.output_audio?.data;
+  if (typeof outputAudioData !== 'string' || outputAudioData.length < 40) {
+    // Eski/alternativ javob shakllari uchun yordamchi parserni ham saqlab qolamiz.
+    const audio = geminiAudioBlokOl(payload);
+    if (!audio?.data) {
+      const err = new Error("Gemini TTS output_audio.data qaytarmadi");
+      err.payload = payload;
+      throw err;
+    }
+    const alt = Buffer.from(audio.data, 'base64');
+    if (!alt.length) throw new Error("Gemini TTS bo'sh audio qaytardi");
+    if (audio.mimeType.includes('wav')) return { wav: alt, model, provider: 'gemini-tts' };
+    return { wav: pcm16ToWav(alt, audio.sampleRate || 24000, audio.channels || 1), model, provider: 'gemini-tts' };
+  }
+
+  const pcm = Buffer.from(outputAudioData, 'base64');
+  if (!pcm.length) throw new Error("Gemini TTS bo'sh audio qaytardi");
+  return { wav: pcm16ToWav(pcm, 24000, 1), model, provider: 'gemini-tts' };
+}
+
 async function aiOvozOldindanTayyorla(speechText, voice, assistantName) {
   const text = String(speechText || '').trim();
   if (!text || !process.env.GEMINI_API_KEY) return null;
@@ -2166,15 +2261,25 @@ async function aiOvozOldindanTayyorla(speechText, voice, assistantName) {
   if (hit && Date.now() - hit.vaqt < AI_TTS_CACHE_MS) return hit.wav;
   if (aiTtsInflight.has(key)) return await aiTtsInflight.get(key);
 
-  const p = geminiLiveOvozYarat(text, voice, assistantName)
-    .then(wav => {
-      if (wav) {
-        aiTtsCache.set(key, { vaqt: Date.now(), wav });
-        if (aiTtsCache.size > 40) aiTtsCache.delete(aiTtsCache.keys().next().value);
-      }
-      return wav;
-    })
-    .finally(() => aiTtsInflight.delete(key));
+  const p = (async () => {
+    let result = null;
+    try {
+      result = await geminiTTSOvozYarat(text, voice, assistantName);
+    } catch (ttsErr) {
+      console.error('Gemini 3.1 TTS xatosi:', ttsErr.message, ttsErr.payload || '');
+      // Fast 2.2: sekin Live fallbackga yashirin o'tmaymiz. Asl TTS xatosini yuqoriga uzatamiz.
+      // Shu bilan 8-10 soniyalik qo'shimcha kutish yo'qoladi va muammo aniq ko'rinadi.
+      throw ttsErr;
+    }
+
+    if (result?.wav) {
+      aiTtsCache.set(key, { vaqt: Date.now(), wav: result.wav, provider: result.provider, model: result.model });
+      if (aiTtsCache.size > 40) aiTtsCache.delete(aiTtsCache.keys().next().value);
+      return result.wav;
+    }
+    return null;
+  })().finally(() => aiTtsInflight.delete(key));
+
   aiTtsInflight.set(key, p);
   return await p;
 }
@@ -2209,18 +2314,26 @@ app.post('/api/aiSpeech', async (req, res) => {
     let wav = null;
     try {
       wav = await aiOvozOldindanTayyorla(speechText, voice, cfg.ism);
-    } catch (liveErr) {
-      console.warn('Gemini Live ovoz xatosi:', liveErr.message);
-      return res.status(502).json({ ok: false, xato: `Gemini Live ovozini yaratib bo'lmadi: ${liveErr.message}` });
+    } catch (voiceErr) {
+      console.warn('Gemini ovoz xatosi:', voiceErr.message);
+      return res.status(502).json({ ok: false, xato: `Gemini ovozini yaratib bo'lmadi: ${voiceErr.message}` });
     }
-    if (!wav) return res.status(503).json({ ok: false, xato: "Gemini Live WebSocket ishlamayapti. Renderda Node.js 22+ ishlating yoki 'ws' paketini o'rnating." });
+    if (!wav) return res.status(503).json({ ok: false, xato: "Gemini ovoz xizmati audio qaytarmadi" });
+
+    const cacheEntry = aiTtsCache.get(ttsKey);
+    const provider = cacheEntry?.provider || 'gemini-tts';
+    const voiceModel = cacheEntry?.model || process.env.GEMINI_TTS_MODEL || 'gemini-3.1-flash-tts-preview';
+    const elapsed = Date.now() - boshlandi;
 
     res.setHeader('Content-Type', 'audio/wav');
     res.setHeader('Cache-Control', 'no-store');
-    res.setHeader('X-AI-Voice', 'gemini-live-fast2');
-    res.setHeader('X-AI-Provider', 'Google-Gemini');
+    res.setHeader('X-AI-Voice', provider === 'gemini-live' ? 'gemini-live-fast2.1' : 'gemini-tts-fast2.1');
+    res.setHeader('X-AI-Provider', provider === 'gemini-live' ? 'Google-Gemini-Live' : 'Google-Gemini-TTS');
+    res.setHeader('X-AI-Model', voiceModel);
+    res.setHeader('X-AI-Voice-Name', voice);
     res.setHeader('X-AI-Cache', oldHit ? 'HIT' : 'MISS');
-    res.setHeader('X-AI-Time-Ms', String(Date.now() - boshlandi));
+    res.setHeader('X-AI-Time-Ms', String(elapsed));
+    console.log(`[AI VOICE] provider=${provider} model=${voiceModel} voice=${voice} cache=${oldHit ? 'HIT' : 'MISS'} ms=${elapsed}`);
     res.send(wav);
   } catch (err) {
     console.error('Gemini ovoz xatosi:', err.message, err.payload || '');
