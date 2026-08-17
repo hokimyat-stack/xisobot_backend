@@ -121,7 +121,7 @@ const AI_CONFIG_KEY = 'AI_ASSISTANT_CONFIG';
 const AI_DEFAULT_CONFIG = Object.freeze({
   ism: 'Hisobchi',
   uygotishSozi: 'Hisobchi',
-  ovoz: 'marin',
+  ovoz: 'Kore',
   avtomatikOvoz: true,
   savollar: [
     "Bugungi holat qanday?",
@@ -133,7 +133,7 @@ const AI_DEFAULT_CONFIG = Object.freeze({
   ]
 });
 
-const AI_TTS_VOICES = new Set(['alloy','ash','ballad','coral','echo','fable','nova','onyx','sage','shimmer','verse','marin','cedar']);
+const AI_TTS_VOICES = new Set(['Zephyr','Puck','Charon','Kore','Fenrir','Leda','Orus','Aoede','Callirrhoe','Autonoe','Enceladus','Iapetus','Umbriel','Algieba','Despina','Erinome','Algenib','Rasalgethi','Laomedeia','Achernar','Alnilam','Schedar','Gacrux','Pulcherrima','Achird','Zubenelgenubi','Vindemiatrix','Sadachbia','Sadaltager','Sulafat']);
 
 function aiConfigTozalash(raw = {}) {
   let savollar = raw.savollar;
@@ -1469,29 +1469,59 @@ function lokalTahlil(facts, exactAnswer) {
   };
 }
 
-function openAITextOl(payload) {
-  if (payload && typeof payload.output_text === 'string' && payload.output_text.trim()) {
-    return payload.output_text.trim();
-  }
-
+function geminiMatnOl(payload) {
   const parts = [];
-  for (const item of (payload?.output || [])) {
-    if (item.type !== 'message') continue;
-    for (const c of (item.content || [])) {
-      if (c.type === 'output_text' && c.text) parts.push(c.text);
+  for (const candidate of (payload?.candidates || [])) {
+    for (const part of (candidate?.content?.parts || [])) {
+      if (typeof part?.text === 'string' && part.text.trim()) parts.push(part.text.trim());
     }
   }
   return parts.join('\n').trim();
 }
 
-async function openAITahlil(facts, savol, exactAnswer) {
-  // API kaliti bo'lmasa ham deterministik lokal analitika ishlaydi.
-  if (!process.env.OPENAI_API_KEY) return lokalTahlil(facts, exactAnswer);
+function geminiJsonMatnTozalash(text) {
+  return String(text || '')
+    .trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+}
+
+async function geminiGenerateContent(model, body) {
+  if (!process.env.GEMINI_API_KEY) {
+    const err = new Error('GEMINI_API_KEY serverda sozlanmagan');
+    err.status = 503;
+    throw err;
+  }
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'x-goog-api-key': process.env.GEMINI_API_KEY,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(body)
+  });
+
+  let payload = {};
+  try { payload = await response.json(); } catch (_) {}
+  if (!response.ok) {
+    const err = new Error(payload?.error?.message || `Gemini API xatosi (${response.status})`);
+    err.status = response.status;
+    err.payload = payload;
+    throw err;
+  }
+  return payload;
+}
+
+async function geminiTahlil(facts, savol, exactAnswer) {
+  // API kaliti bo'lmasa deterministik lokal analitika ishlashda davom etadi.
+  if (!process.env.GEMINI_API_KEY) return lokalTahlil(facts, exactAnswer);
   const aiCfg = await aiConfigOl();
 
   const schema = {
     type: 'object',
-    additionalProperties: false,
     properties: {
       sarlavha: { type: 'string' },
       xulosa: { type: 'string' },
@@ -1500,7 +1530,6 @@ async function openAITahlil(facts, savol, exactAnswer) {
         type: 'array',
         items: {
           type: 'object',
-          additionalProperties: false,
           properties: {
             sarlavha: { type: 'string' },
             matn: { type: 'string' },
@@ -1525,56 +1554,46 @@ async function openAITahlil(facts, savol, exactAnswer) {
     trend: facts.trend
   };
 
-  const response = await fetch('https://api.openai.com/v1/responses', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      model: process.env.OPENAI_MODEL || 'gpt-5.6',
-      store: false,
-      instructions: [
-        `Siz SysOne Xisobot Nazorat platformasidagi ${aiCfg.ism} nomli professional sun'iy intellekt yordamchisiz.`,
-        "Faqat server bergan JSON faktlardan foydalaning; raqamlarni o'ylab topmang va o'zgartirmang.",
-        "Kategoriya so'ralgan bo'lsa faqat o'sha kategoriya bo'yicha gapiring.",
-        "Hisobot topshirmaganlar haqida javobda xodim ism-familiyalarini aytmang; tashkilotlar kesimini ishlating.",
-        "Hisobot topshirgan noyob xodimlar soni va jami hisobotlar soni boshqa-boshqa ko'rsatkich ekanini aniq ajrating.",
-        "O'zbek lotin adabiy tilida ravon, sodda, rasmiy va qisqa yozing. Imlo qoidalariga qat'iy rioya qiling, keraksiz ruscha va inglizcha aralashmalardan qoching; kategoriya o'rniga toifa, monitoring o'rniga kuzatuv, status o'rniga holat so'zlarini ishlating.",
-        "speechText ovozda ravon o'qishga mos, keraksiz belgilar va markdownsiz bo'lsin.",
-        "Muammoli hisobot yoki flag mavzusini foydalanuvchi aniq so'ramasa tilga olmang."
-      ].join(' '),
-      input: `FOYDALANUVCHI SAVOLI:\n${savol || 'Bugungi kunlik hisobotni tahlil qil.'}\n\nSERVER HISOBLAGAN ANIQ JAVOB:\n${exactAnswer}\n\nFAKTLAR:\n${JSON.stringify(safeFacts)}`,
-      max_output_tokens: 1200,
-      text: {
-        format: {
-          type: 'json_schema',
-          name: 'sysone_dashboard_analysis',
-          strict: true,
-          schema
-        }
-      }
-    })
-  });
-
-  const payload = await response.json();
-  if (!response.ok) {
-    console.error('OpenAI API xatosi:', payload);
-    return lokalTahlil(facts, exactAnswer);
-  }
-
-  const text = openAITextOl(payload);
-  if (!text) return lokalTahlil(facts, exactAnswer);
+  const systemText = [
+    `Siz SysOne Xisobot Nazorat platformasidagi ${aiCfg.ism} nomli professional sun'iy intellekt yordamchisiz.`,
+    "Faqat server bergan JSON faktlardan foydalaning; raqamlarni o'ylab topmang va o'zgartirmang.",
+    "Kategoriya so'ralgan bo'lsa faqat o'sha toifa bo'yicha gapiring.",
+    "Hisobot topshirmaganlar haqida javobda xodim ism-familiyalarini aytmang; tashkilotlar kesimini ishlating.",
+    "Hisobot topshirgan noyob xodimlar soni va jami hisobotlar soni boshqa-boshqa ko'rsatkich ekanini aniq ajrating.",
+    "O'zbekiston adabiy o'zbek tilida ravon, sodda, rasmiy va qisqa yozing. Imlo qoidalariga qat'iy rioya qiling. Keraksiz ruscha va inglizcha aralashmalardan qoching; kategoriya o'rniga toifa, monitoring o'rniga kuzatuv, status o'rniga holat so'zlarini ishlating.",
+    "speechText ovozda ravon o'qishga mos, markdownsiz va ortiqcha belgilarsiz bo'lsin.",
+    "Muammoli hisobot yoki flag mavzusini foydalanuvchi aniq so'ramasa tilga olmang."
+  ].join(' ');
 
   try {
+    const model = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
+    const payload = await geminiGenerateContent(model, {
+      systemInstruction: { parts: [{ text: systemText }] },
+      contents: [{
+        role: 'user',
+        parts: [{
+          text: `FOYDALANUVCHI SAVOLI:\n${savol || 'Bugungi kunlik hisobotni tahlil qil.'}\n\nSERVER HISOBLAGAN ANIQ JAVOB:\n${exactAnswer}\n\nFAKTLAR:\n${JSON.stringify(safeFacts)}`
+        }]
+      }],
+      generationConfig: {
+        temperature: 0.2,
+        maxOutputTokens: 1200,
+        responseMimeType: 'application/json',
+        responseJsonSchema: schema
+      }
+    });
+
+    const text = geminiJsonMatnTozalash(geminiMatnOl(payload));
+    if (!text) return lokalTahlil(facts, exactAnswer);
+
     const parsed = JSON.parse(text);
-    // Faktik savol javobi va ovoz matni AI tomonidan o'zgartirilmasin.
+    // Faktik savol javobi server hisoblagan qiymatdan olinadi — model uni o'zgartira olmaydi.
     parsed.savolJavobi = exactAnswer;
     parsed.speechText = speechTextTayyorla(exactAnswer);
     if (!parsed.xulosa) parsed.xulosa = exactAnswer;
     return parsed;
   } catch (err) {
-    console.error('AI JSON parse xatosi:', err.message, text);
+    console.error('Gemini tahlil xatosi:', err.message, err.payload || '');
     return lokalTahlil(facts, exactAnswer);
   }
 }
@@ -1611,8 +1630,8 @@ app.post('/api/aiTahlil', async (req, res) => {
       });
     }
 
-    const tahlil = await openAITahlil(facts, savol, exactAnswer);
-    const model = process.env.OPENAI_API_KEY ? (process.env.OPENAI_MODEL || 'gpt-5.6') : 'SysOne Local Analytics';
+    const tahlil = await geminiTahlil(facts, savol, exactAnswer);
+    const model = process.env.GEMINI_API_KEY ? (process.env.GEMINI_MODEL || 'gemini-3.6-flash') : 'SysOne Local Analytics';
 
     aiCache.set(cacheKey, { vaqt: Date.now(), tahlil, model });
     await auditLog(user.fio, 'AI_TAHLIL', `${facts.sana} | ${facts.kategoriya?.nomi || 'barcha kategoriya'}`);
@@ -1638,7 +1657,7 @@ app.get('/api/aiSozlama', async (req, res) => {
   const user = await checkAuth(req);
   if (!user) return res.status(401).json({ ok: false, xato: "Ruxsat yo'q" });
   const sozlama = await aiConfigOl();
-  res.json({ ok: true, sozlama, ttsBor: !!process.env.OPENAI_API_KEY, sttBor: !!process.env.OPENAI_API_KEY });
+  res.json({ ok: true, sozlama, ttsBor: !!process.env.GEMINI_API_KEY, sttBor: !!process.env.GEMINI_API_KEY, provider: 'Google Gemini', model: process.env.GEMINI_MODEL || 'gemini-3.6-flash', liveModel: process.env.GEMINI_LIVE_MODEL || 'gemini-3.1-flash-live-preview' });
 });
 
 app.post('/api/aiSozlamaSaqla', async (req, res) => {
@@ -1662,79 +1681,194 @@ app.post('/api/aiSozlamaSaqla', async (req, res) => {
 app.post('/api/aiTranscribe', aiAudioUpload.single('audio'), async (req, res) => {
   const user = await checkAuth(req);
   if (!user) return res.status(401).json({ ok: false, xato: "Ruxsat yo'q" });
-  if (!process.env.OPENAI_API_KEY) return res.status(503).json({ ok: false, xato: "OPENAI_API_KEY serverda sozlanmagan" });
+  if (!process.env.GEMINI_API_KEY) return res.status(503).json({ ok: false, xato: "GEMINI_API_KEY serverda sozlanmagan" });
   if (!req.file?.buffer?.length) return res.status(400).json({ ok: false, xato: "Audio topilmadi" });
 
   try {
     const cfg = await aiConfigOl();
-    const form = new FormData();
-    const mime = req.file.mimetype || 'audio/webm';
-    const ext = mime.includes('wav') ? 'wav' : mime.includes('mpeg') ? 'mp3' : mime.includes('mp4') ? 'm4a' : mime.includes('ogg') ? 'ogg' : 'webm';
-    form.append('file', new Blob([req.file.buffer], { type: mime }), `hisobchi-savol.${ext}`);
-    form.append('model', process.env.OPENAI_TRANSCRIBE_MODEL || 'gpt-transcribe');
-    form.append('prompt', `Til: o'zbek tili. Bu SysOne Xisobot Nazorat tizimi. AI yordamchi nomi ${cfg.ism}. Uyg'otish so'zi ${cfg.uygotishSozi}. Tashkilot, kategoriya, hisobot, xodim, bajarilish, foiz, MFY kabi atamalarni aniq yoz.`);
+    const mime = String(req.file.mimetype || 'audio/wav').split(';')[0].toLowerCase();
+    const data = req.file.buffer.toString('base64');
+    const model = process.env.GEMINI_TRANSCRIBE_MODEL || process.env.GEMINI_MODEL || 'gemini-3.6-flash';
 
-    const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}` },
-      body: form
+    const payload = await geminiGenerateContent(model, {
+      systemInstruction: {
+        parts: [{
+          text: `Siz o'zbekcha nutqni matnga ko'chiruvchi yordamchisiz. O'zbekiston adabiy o'zbek tilidagi talaffuzni aniq taning. Yordamchi nomi ${cfg.ism}, uyg'otish so'zi ${cfg.uygotishSozi}. Tashkilot, toifa, hisobot, xodim, bajarilish, foiz, MFY va JSHSHIR kabi tizim atamalarini to'g'ri yozing. Faqat eshitilgan gapning transkripsiyasini qaytaring; izoh, sarlavha yoki qo'shimcha javob yozmang.`
+        }]
+      },
+      contents: [{
+        role: 'user',
+        parts: [
+          { text: "Quyidagi audio yozuvdagi nutqni o'zbek lotin yozuvida aynan matnga ko'chiring." },
+          { inlineData: { mimeType: mime, data } }
+        ]
+      }],
+      generationConfig: { temperature: 0, maxOutputTokens: 400 }
     });
-    const payload = await response.json();
-    if (!response.ok) {
-      console.error('OpenAI transkripsiya xatosi:', payload);
-      return res.status(response.status).json({ ok: false, xato: payload?.error?.message || "Ovozni matnga aylantirib bo'lmadi" });
-    }
-    const matn = String(payload.text || '').trim();
+
+    let matn = geminiMatnOl(payload)
+      .replace(/^```(?:text)?\s*/i, '')
+      .replace(/\s*```$/i, '')
+      .replace(/^(transkripsiya|matn)\s*:\s*/i, '')
+      .trim();
+
+    if (!matn) return res.status(422).json({ ok: false, xato: "Ovozdan matn olinmadi" });
     await auditLog(user.fio, 'AI_OVOZLI_SAVOL', matn.slice(0, 250));
-    res.json({ ok: true, matn, assistantName: cfg.ism, wakeWord: cfg.uygotishSozi });
+    res.json({ ok: true, matn, assistantName: cfg.ism, wakeWord: cfg.uygotishSozi, provider: 'Google Gemini', model });
   } catch (err) {
-    console.error('aiTranscribe xatosi:', err);
-    res.status(500).json({ ok: false, xato: err.message });
+    console.error('Gemini transkripsiya xatosi:', err.message, err.payload || '');
+    res.status(err.status || 500).json({ ok: false, xato: err.message || "Ovozni matnga aylantirib bo'lmadi" });
   }
 });
+
+function pcm16ToWav(pcmBuffer, sampleRate = 24000, channels = 1) {
+  const pcm = Buffer.isBuffer(pcmBuffer) ? pcmBuffer : Buffer.from(pcmBuffer || []);
+  const header = Buffer.alloc(44);
+  const byteRate = sampleRate * channels * 2;
+  const blockAlign = channels * 2;
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(16, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([header, pcm]);
+}
+
+function websocketCtorOl() {
+  if (typeof globalThis.WebSocket === 'function') return { Ctor: globalThis.WebSocket, turi: 'web' };
+  try { return { Ctor: require('ws'), turi: 'ws' }; } catch (_) { return null; }
+}
+
+async function geminiLiveOvozYarat(matn, voice, assistantName) {
+  const wsInfo = websocketCtorOl();
+  if (!wsInfo || !process.env.GEMINI_API_KEY) return null;
+  if (String(process.env.GEMINI_LIVE_TTS || 'true').toLowerCase() === 'false') return null;
+
+  const model = process.env.GEMINI_LIVE_MODEL || 'gemini-3.1-flash-live-preview';
+  const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(process.env.GEMINI_API_KEY)}`;
+
+  return await new Promise((resolve, reject) => {
+    let tugadi = false;
+    let setupTayyor = false;
+    const chunks = [];
+    let ws;
+
+    const yakunla = (err, value) => {
+      if (tugadi) return;
+      tugadi = true;
+      clearTimeout(timer);
+      try { ws?.close(); } catch (_) {}
+      if (err) reject(err); else resolve(value);
+    };
+
+    const timer = setTimeout(() => yakunla(new Error('Gemini Live ovoz javobi vaqti tugadi')), 30000);
+
+    const xabarniQaytaIshla = async raw => {
+      try {
+        let txt;
+        if (typeof raw === 'string') txt = raw;
+        else if (Buffer.isBuffer(raw)) txt = raw.toString('utf8');
+        else if (raw instanceof ArrayBuffer) txt = Buffer.from(raw).toString('utf8');
+        else if (raw?.arrayBuffer) txt = Buffer.from(await raw.arrayBuffer()).toString('utf8');
+        else txt = String(raw || '');
+        const msg = JSON.parse(txt);
+
+        if (msg.setupComplete && !setupTayyor) {
+          setupTayyor = true;
+          ws.send(JSON.stringify({
+            realtimeInput: {
+              text: `Quyidagi matnni aynan o'qing. O'zbekiston adabiy o'zbek tilida ravon, xotirjam va professional talaffuz qiling. Hech qanday yangi gap qo'shmang. MATN: ${matn}`
+            }
+          }));
+          return;
+        }
+
+        const sc = msg.serverContent;
+        for (const part of (sc?.modelTurn?.parts || [])) {
+          if (part?.inlineData?.data) chunks.push(Buffer.from(part.inlineData.data, 'base64'));
+        }
+        if (sc?.turnComplete) {
+          if (!chunks.length) return yakunla(new Error('Gemini Live audio qaytarmadi'));
+          return yakunla(null, pcm16ToWav(Buffer.concat(chunks), 24000, 1));
+        }
+      } catch (err) {
+        yakunla(err);
+      }
+    };
+
+    try {
+      ws = new wsInfo.Ctor(url);
+      const setup = () => ws.send(JSON.stringify({
+        setup: {
+          model: `models/${model}`,
+          generationConfig: {
+            responseModalities: ['AUDIO'],
+            speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } }
+          },
+          outputAudioTranscription: {},
+          systemInstruction: {
+            parts: [{
+              text: `Siz ${assistantName || 'Hisobchi'} nomli o'zbekcha sun'iy intellekt yordamchisining ovozisiz. Faqat O'zbekiston adabiy o'zbek tilida gapiring. So'zlarni ravon va aniq talaffuz qiling. Raqamlar, sanalar va foizlarni shoshmasdan tushunarli ayting. Foydalanuvchiga berilgan matnni mazmunan o'zgartirmang.`
+            }]
+          }
+        }
+      }));
+
+      if (wsInfo.turi === 'ws') {
+        ws.on('open', setup);
+        ws.on('message', data => xabarniQaytaIshla(data));
+        ws.on('error', err => yakunla(err));
+        ws.on('close', () => { if (!tugadi && !chunks.length) yakunla(new Error('Gemini Live ulanishi yopildi')); });
+      } else {
+        ws.addEventListener('open', setup);
+        ws.addEventListener('message', e => xabarniQaytaIshla(e.data));
+        ws.addEventListener('error', () => yakunla(new Error('Gemini Live WebSocket xatosi')));
+        ws.addEventListener('close', () => { if (!tugadi && !chunks.length) yakunla(new Error('Gemini Live ulanishi yopildi')); });
+      }
+    } catch (err) {
+      yakunla(err);
+    }
+  });
+}
 
 app.post('/api/aiSpeech', async (req, res) => {
   const user = await checkAuth(req);
   if (!user) return res.status(401).json({ ok: false, xato: "Ruxsat yo'q" });
-  if (!process.env.OPENAI_API_KEY) return res.status(503).json({ ok: false, xato: "OPENAI_API_KEY serverda sozlanmagan" });
+  if (!process.env.GEMINI_API_KEY) return res.status(503).json({ ok: false, xato: "GEMINI_API_KEY serverda sozlanmagan" });
 
   try {
     const cfg = await aiConfigOl();
     const rawText = String(req.body.text || '').trim().slice(0, 4096);
     if (!rawText) return res.status(400).json({ ok: false, xato: "Ovoz uchun matn bo'sh" });
     const speechText = req.body.normalized === true ? rawText : speechTextTayyorla(rawText);
-    const voice = AI_TTS_VOICES.has(String(req.body.voice || '')) ? String(req.body.voice) : cfg.ovoz;
+    const requestedVoice = String(req.body.voice || '').trim();
+    const voice = AI_TTS_VOICES.has(requestedVoice) ? requestedVoice : cfg.ovoz;
 
-    const response = await fetch('https://api.openai.com/v1/audio/speech', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: process.env.OPENAI_TTS_MODEL || 'gpt-4o-mini-tts',
-        voice,
-        input: speechText,
-        instructions: aiTTSInstructions(cfg.ism),
-        response_format: 'mp3'
-      })
-    });
-
-    if (!response.ok) {
-      let detail = '';
-      try { detail = JSON.stringify(await response.json()); } catch (_) { detail = await response.text(); }
-      console.error('OpenAI TTS xatosi:', detail);
-      return res.status(response.status).json({ ok: false, xato: "Sun'iy intellekt ovozini yaratib bo'lmadi" });
+    let wav = null;
+    try {
+      wav = await geminiLiveOvozYarat(speechText, voice, cfg.ism);
+    } catch (liveErr) {
+      console.warn('Gemini Live ovoz xatosi:', liveErr.message);
+      return res.status(502).json({ ok: false, xato: `Gemini Live ovozini yaratib bo'lmadi: ${liveErr.message}` });
     }
+    if (!wav) return res.status(503).json({ ok: false, xato: "Gemini Live WebSocket ishlamayapti. Renderda Node.js 22+ ishlating yoki 'ws' paketini o'rnating." });
 
-    const buf = Buffer.from(await response.arrayBuffer());
-    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Type', 'audio/wav');
     res.setHeader('Cache-Control', 'no-store');
-    res.setHeader('X-AI-Voice', 'true');
-    res.send(buf);
+    res.setHeader('X-AI-Voice', 'gemini-live');
+    res.setHeader('X-AI-Provider', 'Google-Gemini');
+    res.send(wav);
   } catch (err) {
-    console.error('aiSpeech xatosi:', err);
-    res.status(500).json({ ok: false, xato: err.message });
+    console.error('Gemini ovoz xatosi:', err.message, err.payload || '');
+    res.status(err.status || 500).json({ ok: false, xato: err.message || "Sun'iy intellekt ovozini yaratib bo'lmadi" });
   }
 });
 
